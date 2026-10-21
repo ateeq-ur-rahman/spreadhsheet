@@ -1,7 +1,6 @@
-// Loads a fixture TSV into the engine starting at A1.
-// Deliberately minimal: one setCell per cell, no styling, no type coercion.
-// You may replace this with your own import path. That is fine as long as
-// both "Load" buttons keep working.
+// Loads a fixture TSV at A1, keeping every cell's text exactly as is.
+// It's one transaction, so one Ctrl+Z undoes the whole load (before, each
+// cell was its own undo entry and the history filled up instantly).
 import salesSmall from '../../fixtures/sales.tsv?raw'
 import salesLarge from '../../fixtures/sales-large.tsv?raw'
 
@@ -11,24 +10,26 @@ export function parseTsv(text) {
     return lines.map(line => line.split('\t'))
 }
 
-function loadTsv(engine, text) {
+export function loadTsv(engine, text, label = 'Load sample') {
     const rows = parseTsv(text)
     const cols = Math.max(...rows.map(r => r.length))
     engine.ensureCapacity(rows.length + 20, cols + 5)
+    const updates = []
     for (let r = 0; r < rows.length; r++) {
         for (let c = 0; c < rows[r].length; c++) {
-            engine.setCell(r, c, rows[r][c])
+            updates.push({ row: r, col: c, raw: rows[r][c] })
         }
     }
+    engine.setCells(updates, label)
     return { rows: rows.length, cols }
 }
 
-/** 33 lines: header, 31 messy data rows, totals row. */
+// header, 31 messy rows, totals row
 export function loadSampleSmall(engine) {
-    return loadTsv(engine, salesSmall)
+    return loadTsv(engine, salesSmall, 'Load Sample 33')
 }
 
-/** ~3,000 lines of the same kind of data. */
+// about 3,000 rows of the same
 export function loadSampleLarge(engine) {
-    return loadTsv(engine, salesLarge)
+    return loadTsv(engine, salesLarge, 'Load Sample 3k')
 }

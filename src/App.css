@@ -10,6 +10,17 @@ body {
   color: #202124;
 }
 
+/* index.css makes body a centred flex box, which let #root grow as wide as
+   the grid and the whole page scrolled sideways. Keep the app at screen size. */
+body {
+  display: block;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}
+
 .app-wrapper {
   display: flex;
   flex-direction: column;

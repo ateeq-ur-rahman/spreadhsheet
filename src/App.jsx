@@ -1,274 +1,91 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useSyncExternalStore } from 'react'
 import './App.css'
 import { createEngine } from './engine/core.js'
+import { toA1, rangeToA1 } from './engine/address.js'
 import { loadSampleSmall, loadSampleLarge } from './fixtures/loadSample.js'
+import Grid from './grid/Grid.jsx'
+import { createEditStore } from './grid/editStore.js'
+import { commitEdit, cancelEdit } from './grid/editing.js'
+import { cellSelection, selectionRange } from './grid/selection.js'
 
 const TOTAL_ROWS = 50
 const TOTAL_COLS = 50
 
+const clampSelection = (sel, rows, cols) => {
+  const fix = (p) => ({ r: Math.min(p.r, rows - 1), c: Math.min(p.c, cols - 1) })
+  return { anchor: fix(sel.anchor), focus: fix(sel.focus) }
+}
+
 export default function App() {
-  // Engine instance is created once and reused across renders
-  // Note: The engine maintains its own internal state, so React state is only used for UI updates
-  const [engine] = useState(() => createEngine(TOTAL_ROWS, TOTAL_COLS))
-  const [, setVersion] = useState(0)
-  const [selectedCell, setSelectedCell] = useState(null)
-  const [editingCell, setEditingCell] = useState(null)
-  const [editValue, setEditValue] = useState('')
-  // Cell styles are stored separately from engine data
-  // Format: { "row,col": { bold: bool, italic: bool, ... } }
-  const [cellStyles, setCellStyles] = useState({})
-  const cellInputRef = useRef(null)
+  // The engine has all the sheet data (values, styles, undo). React only
+  // keeps the selection; the text being typed lives in editStore.
+  const [engine] = useState(() => {
+    const e = createEngine(TOTAL_ROWS, TOTAL_COLS)
+    // ?debug exposes the engine for perf/measure.mjs
+    if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug')) window.__engine = e
+    return e
+  })
+  const [editStore] = useState(createEditStore)
+  const version = useSyncExternalStore(engine.subscribe, () => engine.version)
+  const editState = useSyncExternalStore(editStore.subscribe, editStore.get)
+  const [rawSelection, setSelection] = useState(() => cellSelection(0, 0))
 
-  const forceRerender = useCallback(() => setVersion(v => v + 1), [])
+  const selection = clampSelection(rawSelection, engine.rows, engine.cols)
+  const range = selectionRange(selection)
+  const active = selection.anchor
+  const activeStyle = engine.getStyle(active.r, active.c)
 
-  // ────── Cell style helpers ──────
+  // formatting applies to everything selected
 
-  const getCellStyle = useCallback((row, col) => {
-    const key = `${row},${col}`
-    return cellStyles[key] || {
-      bold: false, italic: false, underline: false,
-      bg: 'white', color: '#202124', align: 'left', fontSize: 13
+  const applyStyle = (patch) => engine.setStyle(range, patch)
+  const toggle = (prop) => applyStyle({ [prop]: !activeStyle[prop] })
+
+  // formula bar
+
+  const formulaBarValue = editState.editing ? editState.value : engine.getRaw(active.r, active.c)
+
+  const handleFormulaBarFocus = () => {
+    if (!editState.editing) editStore.start(active.r, active.c, engine.getRaw(active.r, active.c), 'edit')
+  }
+
+  const handleFormulaBarKeyDown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      const cell = commitEdit(engine, editStore)
+      if (cell) setSelection(cellSelection(Math.min(cell.r + 1, engine.rows - 1), cell.c))
+      e.currentTarget.blur()
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      cancelEdit(editStore)
+      e.currentTarget.blur()
     }
-  }, [cellStyles])
+  }
 
-  const updateCellStyle = useCallback((row, col, updates) => {
-    const key = `${row},${col}`
-    setCellStyles(prev => ({
-      ...prev,
-      [key]: { ...getCellStyle(row, col), ...updates }
-    }))
-  }, [getCellStyle])
+  // insert/delete use however many rows or columns are selected
 
-  // ────── Cell editing ──────
+  const rowCount = range.r2 - range.r1 + 1
+  const colCount = range.c2 - range.c1 + 1
+  const insertRows = () => engine.insertRow(range.r1, rowCount)
+  const deleteRows = () => engine.deleteRow(range.r1, Math.min(rowCount, engine.rows - 1))
+  const insertCols = () => engine.insertColumn(range.c1, colCount)
+  const deleteCols = () => engine.deleteColumn(range.c1, Math.min(colCount, engine.cols - 1))
 
-  const startEditing = useCallback((row, col) => {
-    setSelectedCell({ r: row, c: col })
-    setEditingCell({ r: row, c: col })
-    const cellData = engine.getCell(row, col)
-    setEditValue(cellData.raw)
-    setTimeout(() => cellInputRef.current?.focus(), 0)
-  }, [engine])
-
-  const commitEdit = useCallback((row, col) => {
-    // Only commit if the value actually changed to avoid unnecessary recalculations
-    const currentCell = engine.getCell(row, col)
-    if (currentCell.raw !== editValue) {
-      engine.setCell(row, col, editValue)
-      forceRerender()
-    }
-    setEditingCell(null)
-  }, [engine, editValue, forceRerender])
-
-  const handleCellClick = useCallback((row, col) => {
-    if (editingCell && (editingCell.r !== row || editingCell.c !== col)) {
-      commitEdit(editingCell.r, editingCell.c)
-    }
-    if (!editingCell || editingCell.r !== row || editingCell.c !== col) {
-      startEditing(row, col)
-    }
-  }, [editingCell, commitEdit, startEditing])
-
-  // ────── Keyboard navigation ──────
-
-  const handleKeyDown = useCallback((event, row, col) => {
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(Math.min(row + 1, engine.rows - 1), col)
-    } else if (event.key === 'Tab') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(row, Math.min(col + 1, engine.cols - 1))
-    } else if (event.key === 'Escape') {
-      setEditValue(engine.getCell(row, col).raw)
-      setEditingCell(null)
-    } else if (event.key === 'ArrowDown') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(Math.min(row + 1, engine.rows - 1), col)
-    } else if (event.key === 'ArrowUp') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(Math.max(row - 1, 0), col)
-    } else if (event.key === 'ArrowLeft') {
-      event.preventDefault()
-      commitEdit(row, col)
-      if (col > 0) {
-        startEditing(row, col - 1)
-      } else if (row > 0) {
-        startEditing(row - 1, engine.cols - 1)
-      }
-    } else if (event.key === 'ArrowRight') {
-      event.preventDefault()
-      commitEdit(row, col)
-      startEditing(row, Math.min(col + 1, engine.cols - 1))
-    }
-  }, [engine, commitEdit, startEditing])
-
-  // ────── Formula bar handlers ──────
-
-  const handleFormulaBarKeyDown = useCallback((event) => {
-    if (!editingCell) return
-    handleKeyDown(event, editingCell.r, editingCell.c)
-  }, [editingCell, handleKeyDown])
-
-  const handleFormulaBarFocus = useCallback(() => {
-    if (selectedCell && !editingCell) {
-      setEditingCell(selectedCell)
-      setEditValue(engine.getCell(selectedCell.r, selectedCell.c).raw)
-    }
-  }, [selectedCell, editingCell, engine])
-
-  const handleFormulaBarChange = useCallback((value) => {
-    if (!editingCell && selectedCell) setEditingCell(selectedCell)
-    setEditValue(value)
-  }, [editingCell, selectedCell])
-
-  // ────── Undo / Redo ──────
-
-  const handleUndo = useCallback(() => { if (engine.undo()) forceRerender() }, [engine, forceRerender])
-  const handleRedo = useCallback(() => { if (engine.redo()) forceRerender() }, [engine, forceRerender])
-
-  // ────── Formatting toggles ──────
-
-  const toggleBold = useCallback(() => {
-    if (!selectedCell) return
-    const style = getCellStyle(selectedCell.r, selectedCell.c)
-    updateCellStyle(selectedCell.r, selectedCell.c, { bold: !style.bold })
-  }, [selectedCell, getCellStyle, updateCellStyle])
-
-  const toggleItalic = useCallback(() => {
-    if (!selectedCell) return
-    const style = getCellStyle(selectedCell.r, selectedCell.c)
-    updateCellStyle(selectedCell.r, selectedCell.c, { italic: !style.italic })
-  }, [selectedCell, getCellStyle, updateCellStyle])
-
-  const toggleUnderline = useCallback(() => {
-    if (!selectedCell) return
-    const style = getCellStyle(selectedCell.r, selectedCell.c)
-    updateCellStyle(selectedCell.r, selectedCell.c, { underline: !style.underline })
-  }, [selectedCell, getCellStyle, updateCellStyle])
-
-  const changeFontSize = useCallback((size) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { fontSize: size })
-  }, [selectedCell, updateCellStyle])
-
-  const changeAlignment = useCallback((align) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { align })
-  }, [selectedCell, updateCellStyle])
-
-  const changeFontColor = useCallback((color) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { color })
-  }, [selectedCell, updateCellStyle])
-
-  const changeBackgroundColor = useCallback((color) => {
-    if (!selectedCell) return
-    updateCellStyle(selectedCell.r, selectedCell.c, { bg: color })
-  }, [selectedCell, updateCellStyle])
-
-  // ────── Clear operations ──────
-
-  const clearSelectedCell = useCallback(() => {
-    if (!selectedCell) return
-    engine.setCell(selectedCell.r, selectedCell.c, '')
-    forceRerender()
-    // Remove style entry for cleared cell
-    // Note: This deletes the style object entirely - if you need to preserve default styles,
-    // you may want to set them explicitly rather than deleting
-    const key = `${selectedCell.r},${selectedCell.c}`
-    setCellStyles(prev => { const next = { ...prev }; delete next[key]; return next })
-    setEditValue('')
-  }, [selectedCell, engine, forceRerender])
-
-  const clearAllCells = useCallback(() => {
-    for (let r = 0; r < engine.rows; r++) {
-      for (let c = 0; c < engine.cols; c++) {
-        engine.setCell(r, c, '')
-      }
-    }
-    forceRerender()
-    setCellStyles({})
-    setSelectedCell(null)
-    setEditingCell(null)
-    setEditValue('')
-  }, [engine, forceRerender])
-
-  // ────── Sample data (fixtures/sales.tsv) ──────
-
-  const loadSample = useCallback((loader) => {
+  const loadSample = (loader) => {
+    cancelEdit(editStore)
     loader(engine)
-    forceRerender()
-    setSelectedCell({ r: 0, c: 0 })
-    setEditingCell(null)
-    setEditValue('')
-  }, [engine, forceRerender])
+    setSelection(cellSelection(0, 0))
+  }
 
-  // ────── Row / Column operations ──────
+  const clearAll = () => {
+    cancelEdit(editStore)
+    engine.clearAll()
+    setSelection(cellSelection(0, 0))
+  }
 
-  const insertRow = useCallback(() => {
-    if (!selectedCell) return
-    engine.insertRow(selectedCell.r)
-    forceRerender()
-    setSelectedCell({ r: selectedCell.r + 1, c: selectedCell.c })
-  }, [selectedCell, engine, forceRerender])
+  const status = range.r1 === range.r2 && range.c1 === range.c2
+    ? toA1(active.r, active.c)
+    : `${rangeToA1(range)} (${rowCount}R × ${colCount}C)`
 
-  const deleteRow = useCallback(() => {
-    if (!selectedCell) return
-    engine.deleteRow(selectedCell.r)
-    forceRerender()
-    if (selectedCell.r >= engine.rows) {
-      setSelectedCell({ r: engine.rows - 1, c: selectedCell.c })
-    }
-  }, [selectedCell, engine, forceRerender])
-
-  const insertColumn = useCallback(() => {
-    if (!selectedCell) return
-    engine.insertColumn(selectedCell.c)
-    forceRerender()
-    setSelectedCell({ r: selectedCell.r, c: selectedCell.c + 1 })
-  }, [selectedCell, engine, forceRerender])
-
-  const deleteColumn = useCallback(() => {
-    if (!selectedCell) return
-    engine.deleteColumn(selectedCell.c)
-    forceRerender()
-    if (selectedCell.c >= engine.cols) {
-      setSelectedCell({ r: selectedCell.r, c: engine.cols - 1 })
-    }
-  }, [selectedCell, engine, forceRerender])
-
-  // ────── Derived state ──────
-
-  const selectedCellStyle = useMemo(() => {
-    return selectedCell ? getCellStyle(selectedCell.r, selectedCell.c) : null
-  }, [selectedCell, getCellStyle])
-
-  const getColumnLabel = useCallback((col) => {
-    let label = ''
-    let num = col + 1
-    while (num > 0) {
-      num--
-      label = String.fromCharCode(65 + (num % 26)) + label
-      num = Math.floor(num / 26)
-    }
-    return label
-  }, [])
-
-  const selectedCellLabel = selectedCell
-    ? `${getColumnLabel(selectedCell.c)}${selectedCell.r + 1}`
-    : 'No cell'
-
-  // Formula bar shows the raw formula text, not the computed value
-  // When editing, show the current editValue; otherwise show the cell's raw content
-  // Note: This is different from the cell display, which shows computed values
-  const formulaBarValue = editingCell
-    ? editValue
-    : (selectedCell ? engine.getCell(selectedCell.r, selectedCell.c).raw : '')
-
-  // ────── Render ──────
 
   return (
     <div className="app-wrapper">
@@ -278,17 +95,17 @@ export default function App() {
 
       <div className="main-content">
 
-        {/* ── Toolbar ── */}
-        <div className="toolbar">
+        {/* Toolbar */}
+        <div className="toolbar" onMouseDown={() => commitEdit(engine, editStore)}>
           <div className="toolbar-group">
-            <button className={`toolbar-btn bold-btn ${selectedCellStyle?.bold ? 'active' : ''}`} onClick={toggleBold} title="Bold">B</button>
-            <button className={`toolbar-btn italic-btn ${selectedCellStyle?.italic ? 'active' : ''}`} onClick={toggleItalic} title="Italic">I</button>
-            <button className={`toolbar-btn underline-btn ${selectedCellStyle?.underline ? 'active' : ''}`} onClick={toggleUnderline} title="Underline">U</button>
+            <button className={`toolbar-btn bold-btn ${activeStyle.bold ? 'active' : ''}`} onClick={() => toggle('bold')} title="Bold (Ctrl+B)">B</button>
+            <button className={`toolbar-btn italic-btn ${activeStyle.italic ? 'active' : ''}`} onClick={() => toggle('italic')} title="Italic (Ctrl+I)">I</button>
+            <button className={`toolbar-btn underline-btn ${activeStyle.underline ? 'active' : ''}`} onClick={() => toggle('underline')} title="Underline (Ctrl+U)">U</button>
           </div>
 
           <div className="toolbar-group">
             <span className="toolbar-label">Size:</span>
-            <select className="toolbar-select" value={selectedCellStyle?.fontSize || 13} onChange={(e) => changeFontSize(parseInt(e.target.value))}>
+            <select className="toolbar-select" value={activeStyle.fontSize} onChange={(e) => applyStyle({ fontSize: parseInt(e.target.value, 10) })}>
               {[8, 10, 11, 12, 13, 14, 16, 18, 20, 24].map(s => (
                 <option key={s} value={s}>{s}</option>
               ))}
@@ -296,17 +113,17 @@ export default function App() {
           </div>
 
           <div className="toolbar-group">
-            <button className={`align-btn ${selectedCellStyle?.align === 'left' ? 'active' : ''}`} onClick={() => changeAlignment('left')} title="Align Left">⬤←</button>
-            <button className={`align-btn ${selectedCellStyle?.align === 'center' ? 'active' : ''}`} onClick={() => changeAlignment('center')} title="Align Center">⬤</button>
-            <button className={`align-btn ${selectedCellStyle?.align === 'right' ? 'active' : ''}`} onClick={() => changeAlignment('right')} title="Align Right">⬤→</button>
+            <button className={`align-btn ${activeStyle.align === 'left' ? 'active' : ''}`} onClick={() => applyStyle({ align: 'left' })} title="Align Left">⬤←</button>
+            <button className={`align-btn ${activeStyle.align === 'center' ? 'active' : ''}`} onClick={() => applyStyle({ align: 'center' })} title="Align Center">⬤</button>
+            <button className={`align-btn ${activeStyle.align === 'right' ? 'active' : ''}`} onClick={() => applyStyle({ align: 'right' })} title="Align Right">⬤→</button>
           </div>
 
           <div className="toolbar-group">
             <span className="toolbar-label">Text:</span>
             <input
               type="color"
-              value={selectedCellStyle?.color || '#000000'}
-              onChange={(e) => changeFontColor(e.target.value)}
+              value={activeStyle.color}
+              onChange={(e) => applyStyle({ color: e.target.value })}
               title="Font color"
               style={{ width: '32px', height: '32px', border: '1px solid #dadce0', cursor: 'pointer', borderRadius: '4px' }}
             />
@@ -314,7 +131,7 @@ export default function App() {
 
           <div className="toolbar-group">
             <span className="toolbar-label">Fill:</span>
-            <select className="toolbar-select" value={selectedCellStyle?.bg || 'white'} onChange={(e) => changeBackgroundColor(e.target.value)}>
+            <select className="toolbar-select" value={activeStyle.bg} onChange={(e) => applyStyle({ bg: e.target.value })}>
               <option value="white">White</option>
               <option value="#ffff99">Yellow</option>
               <option value="#99ffcc">Green</option>
@@ -327,20 +144,20 @@ export default function App() {
           </div>
 
           <div className="toolbar-group">
-            <button className="toolbar-btn" onClick={handleUndo} disabled={!engine.canUndo()} title="Undo">↶ Undo</button>
-            <button className="toolbar-btn" onClick={handleRedo} disabled={!engine.canRedo()} title="Redo">↷ Redo</button>
+            <button className="toolbar-btn" onClick={() => engine.undo()} disabled={!engine.canUndo()} title={`Undo ${engine.undoLabel() ?? ''} (Ctrl+Z)`}>↶ Undo</button>
+            <button className="toolbar-btn" onClick={() => engine.redo()} disabled={!engine.canRedo()} title={`Redo ${engine.redoLabel() ?? ''} (Ctrl+Y)`}>↷ Redo</button>
           </div>
 
           <div className="toolbar-group">
-            <button className="toolbar-btn" onClick={insertRow} title="Insert Row">+ Row</button>
-            <button className="toolbar-btn" onClick={deleteRow} title="Delete Row">- Row</button>
-            <button className="toolbar-btn" onClick={insertColumn} title="Insert Column">+ Col</button>
-            <button className="toolbar-btn" onClick={deleteColumn} title="Delete Column">- Col</button>
+            <button className="toolbar-btn" onClick={insertRows} title="Insert row(s) above the selection">+ Row</button>
+            <button className="toolbar-btn" onClick={deleteRows} title="Delete the selected row(s)">- Row</button>
+            <button className="toolbar-btn" onClick={insertCols} title="Insert column(s) left of the selection">+ Col</button>
+            <button className="toolbar-btn" onClick={deleteCols} title="Delete the selected column(s)">- Col</button>
           </div>
 
           <div className="toolbar-group">
-            <button className="toolbar-btn danger" onClick={clearSelectedCell}>✕ Cell</button>
-            <button className="toolbar-btn danger" onClick={clearAllCells}>✕ All</button>
+            <button className="toolbar-btn danger" onClick={() => engine.clearRange(range)} title="Clear the selection (Delete)">✕ Clear</button>
+            <button className="toolbar-btn danger" onClick={clearAll}>✕ All</button>
           </div>
 
           <div className="toolbar-group">
@@ -349,96 +166,31 @@ export default function App() {
           </div>
         </div>
 
-        {/* ── Formula Bar ── */}
+        {/* Formula Bar */}
         <div className="formula-bar">
-          <span className="formula-bar-label">{selectedCellLabel}</span>
+          <span className="formula-bar-label" data-testid="selection-label">{status}</span>
           <input
             className="formula-bar-input"
             value={formulaBarValue}
-            onChange={(e) => handleFormulaBarChange(e.target.value)}
+            onChange={(e) => editStore.setValue(e.target.value)}
             onKeyDown={handleFormulaBarKeyDown}
             onFocus={handleFormulaBarFocus}
             placeholder="Select a cell then type, or enter a formula like =SUM(A1:A5)"
           />
         </div>
 
-        {/* ── Grid ── */}
-        <div className="grid-scroll">
-          <table className="grid-table">
-            <thead>
-              <tr>
-                <th className="col-header-blank"></th>
-                {Array.from({ length: engine.cols }, (_, colIndex) => (
-                  <th key={colIndex} className="col-header">
-                    {getColumnLabel(colIndex)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {Array.from({ length: engine.rows }, (_, rowIndex) => (
-                <tr key={rowIndex}>
-                  <td className="row-header">{rowIndex + 1}</td>
-                  {Array.from({ length: engine.cols }, (_, colIndex) => {
-                    const isSelected = selectedCell?.r === rowIndex && selectedCell?.c === colIndex
-                    const isEditing = editingCell?.r === rowIndex && editingCell?.c === colIndex
-                    const cellData = engine.getCell(rowIndex, colIndex)
-                    const style = cellStyles[`${rowIndex},${colIndex}`] || {}
-                    const displayValue = cellData.error
-                      ? cellData.error
-                      : (cellData.computed !== null && cellData.computed !== '' ? String(cellData.computed) : cellData.raw)
-
-                    return (
-                      <td
-                        key={colIndex}
-                        className={`cell ${isSelected ? 'selected' : ''}`}
-                        style={{ background: style.bg || 'white' }}
-                        onMouseDown={(e) => { e.preventDefault(); handleCellClick(rowIndex, colIndex) }}
-                      >
-                        {isEditing ? (
-                          <input
-                            autoFocus
-                            className="cell-input"
-                            value={editValue}
-                            onChange={(e) => setEditValue(e.target.value)}
-                            onBlur={() => commitEdit(rowIndex, colIndex)}
-                            onKeyDown={(e) => handleKeyDown(e, rowIndex, colIndex)}
-                            ref={isSelected ? cellInputRef : undefined}
-                            style={{
-                              fontWeight: style.bold ? 'bold' : 'normal',
-                              fontStyle: style.italic ? 'italic' : 'normal',
-                              textDecoration: style.underline ? 'underline' : 'none',
-                              color: style.color || '#202124',
-                              fontSize: (style.fontSize || 13) + 'px',
-                              textAlign: style.align || 'left',
-                              background: style.bg || 'white',
-                            }}
-                          />
-                        ) : (
-                          <div
-                            className={`cell-display align-${style.align || 'left'} ${cellData.error ? 'error' : ''}`}
-                            style={{
-                              fontWeight: style.bold ? 'bold' : 'normal',
-                              fontStyle: style.italic ? 'italic' : 'normal',
-                              textDecoration: style.underline ? 'underline' : 'none',
-                              color: cellData.error ? '#d93025' : (style.color || '#202124'),
-                              fontSize: (style.fontSize || 13) + 'px',
-                            }}
-                          >
-                            {displayValue}
-                          </div>
-                        )}
-                      </td>
-                    )
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        {/* Grid */}
+        <Grid
+          engine={engine}
+          version={version}
+          selection={selection}
+          onSelectionChange={setSelection}
+          editStore={editStore}
+          onFormat={toggle}
+        />
 
         <p className="footer-hint">
-          Click a cell to edit · Enter/Tab/Arrow keys to navigate · Formulas: =A1+B1 · =SUM(A1:A5) · =AVG(A1:A5) · =MAX(A1:A5) · =MIN(A1:A5)
+          Click to select · drag / Shift+Click / Shift+Arrow to extend · double-click, Enter, F2 or type to edit · drag the ■ handle to fill · Delete clears · Ctrl+Z / Ctrl+Y
         </p>
       </div>
     </div>

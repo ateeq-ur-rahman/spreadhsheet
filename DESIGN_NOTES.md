@@ -3,6 +3,7 @@
 ## Challenges
 
 - **Challenge 1: range selection and fill handle** (`challenge-1-fill-handle`). Before the fill handle could work I had to fix the engine underneath it: the formula parser couldn't parse ranges, recalc redid everything on every edit, and undo didn't group anything. So this branch also carries the engine groundwork the later challenges build on.
+- **Challenge 2: sort and filter** (`challenge-2-sort-filter`, built on Challenge 1). Rows and columns got stable ids, sort is a real edit that moves rows (and formulas follow them), and filters are a view that only hides rows.
 
 ## Data model changes
 
@@ -15,6 +16,9 @@ What's inside the engine:
 - **`styles`**: full style objects per cell (bold, italic, underline, bg, color, align, fontSize, numberFormat). Identical styles share one frozen object. They used to be React state keyed by `"r,c"`, which meant they couldn't be undone and didn't move when you inserted a row.
 - **Dependency index**: `refDeps` maps a cell to the formulas that reference it directly. `rangeDeps` and `rangeCols` handle ranges, so `SUM(A1:A100)` depends on all 100 cells, not just A1 and A100.
 - **Undo/redo stacks**: each entry is a label plus the list of operations that reverse it.
+- **Row and column ids** (`rowIds`, `colIds`): one number per position. Inserting, deleting or sorting moves the ids along with the data. Sort uses row ids to get back to the original order. Filters are stored per column id, so inserting a column in front doesn't move a filter onto the wrong column. Undoing a delete puts the same ids back.
+- **Filters**: a `Map` from column id to `{ include, condition }`. Hidden rows aren't stored; they're worked out from the current values and cached until something changes.
+- **Sort state**: which column is sorted and which way, plus the block's row ids from before the first sort (for the third click, "original order").
 
 Things that are always true:
 - After a transaction finishes, every formula cell has a computed value.
@@ -62,6 +66,17 @@ Coordinates are zero-based; a range is `{r1, c1, r2, c2}`, inclusive.
 | `canUndo()`, `canRedo()`, `undoLabel()`, `redoLabel()` | for the toolbar and tests | |
 | `ensureCapacity(rows, cols)` | grow the sheet bounds (not undoable, doesn't touch data) | |
 | `subscribe(fn)` / `version` | change notifications; the UI uses `version` as its snapshot | |
+| `sortColumn(col, dir, range?)` | sort by a column, `dir` is `'asc'`, `'desc'` or `'original'`; `range` is a selection to sort instead of the whole table | the sort |
+| `cycleSort(col, range?)` | what the ⇅ button does: asc, then desc, then original; returns the direction it used | that click |
+| `getSortState()` | `{ col, dir }` or null | |
+| `clearSortState()` | forget the sort (used when loading a sample) | |
+| `setFilter(col, spec)` | set or clear (`null`) one column's filter, see below | that change |
+| `getFilter(col)` | the column's filter spec or null | |
+| `clearFilters()` | remove every filter | all of them |
+| `getFilterValues(col)` | distinct values for the checklist: `[{ key, label, count }]` | |
+| `getHiddenRows()` / `isRowHidden(r)` | rows hidden by filters | |
+| `filterStatus()` | `{ visible, total }` data rows, or null with no filter on | |
+| `getRowId(r)` / `getColId(c)` | stable ids | |
 
 ## How fill decides what to write
 
@@ -80,9 +95,49 @@ Three decisions worth knowing about:
 - **The date acceptance check.** B2:B4 is 2024-01-03, 2024-01-05, 1/8/2024: days 0, 2 and 5, so not evenly spaced. I use the same best-fit rule as for numbers (2.5 days per step, rounded), giving 2024-01-10, 2024-01-13, 1/15/2024, 2024-01-18. Each cell keeps its seed's format.
 - **Fill always gets its own undo step,** even when it writes what was already there. In `sales.tsv`, A4:A6 already contain ORD-1003…1005, so the A2:A3 → A6 acceptance fill changes nothing. Without the extra step, pressing Ctrl+Z afterwards would undo the whole sample load.
 
+## Sort and filter
+
+**Sorting is a real edit.** Rows get moved, and that's one undo step. Which rows move:
+- With a multi-cell selection (not whole rows or columns), exactly the selected rows. Whole rows move, not just the selected columns, so nothing gets out of line.
+- Otherwise row 2 to the last used row. Row 1 is the header. A last row that starts with Total/Totals/Subtotal/Sum (the contract's rule) stays pinned at the bottom.
+- With a filter on, only the visible rows swap places among themselves. Hidden rows keep their positions.
+
+How values compare:
+- Numbers come before dates, then text, then errors. Blanks always go last, whichever direction.
+- Currency and percent text count as numbers (`$9,720.00` is 9720).
+- The three date formats are compared as dates.
+- Text is compared ignoring case and surrounding spaces.
+- Ties keep their current order (stable).
+- Descending flips everything except blanks, so text comes before numbers, as in Excel.
+- A row with no typed content goes after everything else, even rows whose key is just blank. Formulas don't count as content, because in the sample the empty row 19 still gets `=J19/G19` from the fill. So in the acceptance check ORD-1021 (no Total) comes second to last and the empty row last, just above Total.
+
+Formulas follow rows. Sorting is a "permute" operation:
+- Every single reference into the sorted block is rewritten to where its row went, across the whole sheet, `$` refs included. `=J2/G2` sitting in a moved row still points at its own row afterwards.
+- Ranges are left exactly as written, so `=SUM(J2:J32)` doesn't change. Partly overlapping ranges are also left alone (that's what Excel does).
+- Styles and row ids move with their rows.
+- Undo is the inverse permutation.
+
+The ⇅ button cycles ascending → descending → original order. "Original" puts the rows back in the order they had before the first sort, matched by row id, so it still works after you've edited values in between.
+
+**Filters are a view.** They never change data, formulas still see hidden rows, and hidden rows have zero height in the grid, so the row numbers show gaps. Each column's filter is:
+- `include`: the ticked values from the checklist (as trimmed lower-case keys, `''` for blanks), or `null` for everything
+- `condition`: contains, greater than, less than or is empty, or `null`
+
+A row must pass both parts, and every filtered column (AND). Greater/less than compare as dates when the value is a date, otherwise as numbers, the same rule as the AI query executor. Filtering covers rows 2 to the last used row. The totals row isn't special here: it hides like any other row that doesn't match.
+
+**"West", "West " and "west".** Filtering Region to West matches all three. The checklist groups values the same way the contract normalises text (trim and lower-case), so the three spellings are one entry, "West" (whichever came first), with a count of 8. I think that's what someone filtering by region expects. Treating "west" as a different region would hide data because of a typo.
+
+Changing a filter is an undo step, since the acceptance check expects "undo twice" to remove both the sort and the filter.
+
+UI:
+- Clicking a column letter still selects the column (Challenge 1). Each column with data gets two small buttons: ⇅ to sort and ▾ for the filter menu.
+- The menu has sort buttons, a condition, a search box, a checklist with counts and (Blanks), and Apply / Clear column / Clear all.
+- The status line shows "8 of 32 rows" with a Clear filters button.
+- Arrow keys skip hidden rows.
+
 ## Undo
 
-Every change is made of small operations: set a cell, set a style, insert/delete rows or columns. Each one records how to reverse itself as it runs, and a transaction collects them into one undo entry. Undo plays the reversals backwards, and that records the redo steps in the same way.
+Every change is made of small operations: set a cell, set a style, insert/delete rows or columns, move rows (sort), set a filter. Each one records how to reverse itself as it runs, and a transaction collects them into one undo entry. Undo plays the reversals backwards, and that records the redo steps in the same way.
 
 Deleting rows records "insert them back, restore the deleted cells and styles, and restore the original text of every formula the delete rewrote". Nothing takes a full copy of the sheet any more.
 
@@ -94,7 +149,9 @@ Deleting rows records "insert them back, restore the deleted cells and styles, a
 | Bold/italic/underline/size/align/colour on a selection | the whole selection |
 | Insert/delete rows or columns (as many as are selected) | the whole insert/delete |
 | ⬇ Sample 33 / ⬇ Sample 3k | the whole load |
-| ✕ All | everything |
+| ✕ All | everything (content, formatting, filters, sort state) |
+| ⇅ click or Sort A→Z / Z→A in the menu | that sort (each click is its own step) |
+| Apply in the filter menu, Clear column, Clear all, Clear filters | that filter change |
 
 ## UI
 
@@ -135,14 +192,18 @@ Setup: Linux container, headless Chromium 141 through Playwright, production bui
 |---|---|---|---|
 | Fill 5,000 cells in under 200 ms | K2 `=G2*H2` dragged to K5001 (5,000 formulas) | median 35.9 ms, max 48.2 ms | median 283.8 ms, max 575.9 ms |
 | Fill 5,000 cells in under 200 ms | A2:E3 (IDs, dates, names) dragged down 1,000 rows | median 4.0 ms, max 8.2 ms | median 180.1 ms, max 219.0 ms |
+| Sort 10,000 rows in under 300 ms | 10,000 generated rows, 4 columns including a formula column, by a number column, descending | median 104.0 ms, max 131.7 ms | median 1,134.7 ms, max 1,438.6 ms |
+| Report: sort sales-large.tsv by Date | Sample 3k (2,990 data rows), Date ascending | median 61.3 ms, max 68.2 ms | median 986.8 ms, max 1,038.9 ms |
 
-The fill itself is well within budget. Painting the result isn't yet, because this branch still renders every row header and every filled cell. Only rendering what's on screen is Challenge 3. The same 5,000-formula fill took 70 ms in Node (Vitest, cold start).
+(Sort numbers measured on the `challenge-2-sort-filter` branch; fill numbers on `challenge-1-fill-handle`.)
+
+The fill and the sort are well within budget. Painting the result isn't yet, because these branches still render every row header and every filled cell (3,000 to 10,000 rows of DOM). Only rendering what's on screen is Challenge 3. The same 5,000-formula fill took 70 ms in Node (Vitest, cold start).
 
 For comparison, before these changes: loading Sample 3k and rendering it took 8.5 s (153,612 `<td>` elements), and inserting a row with 50,000 filled cells took 7.5 s in Node.
 
 ## Tests
 
-`npm test` runs 59 tests:
+`npm test` runs 78 tests:
 
 - `values.test.js`: how numbers, dates and text are read.
 - `formula.test.js`: parser, errors, fill translation, insert/delete rewriting, and regression tests for the bugs above.
@@ -150,9 +211,11 @@ For comparison, before these changes: loading Sample 3k and rendering it took 8.
 - `engine.test.js`: transactions, rollback, no-op edits, styles through insert/delete, clearing, fill in each direction, used range.
 - `selection.test.js`: selection and fill-handle direction.
 - `acceptance.challenge1.test.js`: the four acceptance checks from the challenge, on `sales.tsv`.
+- `sortFilter.test.js`: the comparator, filter conditions, totals label, sort cycling, formulas and styles following rows, selection sorts, filters with AND, distinct values, filters surviving a column insert, row ids on undo.
+- `acceptance.challenge2.test.js`: the Challenge 2 checks on `sales.tsv` (Total descending with K = J/G, West filter then Units sort, undo twice).
 - `core.test.js`: the original starter tests, unchanged.
 
-I also drove the UI in the production build with Playwright using real mouse and keyboard input: Shift+Click, header clicks, fill-handle drags that scroll past the edge, F2, double-click, Escape, Delete then undo, Ctrl+A, and drag-select.
+I also drove the UI in the production build with Playwright using real mouse and keyboard input: Shift+Click, header clicks, fill-handle drags that scroll past the edge, F2, double-click, Escape, Delete then undo, Ctrl+A, and drag-select. For Challenge 2 the same script runs the acceptance flow through the ⇅ buttons and the filter menu: sort Total descending, filter Region to West (8 of 32 rows, gaps in the row numbers), sort by Units with hidden rows staying put, two undos, arrow keys skipping hidden rows, and a condition filter combined with the checklist.
 
 ## AI
 
@@ -164,6 +227,9 @@ Not started yet (Challenges 4 and 5).
 - The range index scans every range formula in a column when a cell in that column changes. With thousands of overlapping ranges I'd switch to an interval tree.
 - Currency text like `$1.00, $2.00` repeats instead of counting up.
 - No copy/paste yet.
+- Hidden rows are recomputed from scratch after any change. That's fine at a few thousand rows; for 100k I'd only re-test the rows that changed.
+- Fill and Delete on a filtered range still touch hidden rows (Excel skips them).
+- Sorting a selection moves whole rows. Sorting only the selected columns would be closer to Excel, but it splits rows apart, and formulas following rows gets messy.
 
 ## Use of AI tools
 

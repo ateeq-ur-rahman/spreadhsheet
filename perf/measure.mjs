@@ -75,4 +75,25 @@ await scenario(
     'e.fill({ r1: 1, c1: 0, r2: 2, c2: 4 }, { r1: 1, c1: 0, r2: 1002, c2: 4 })',
 )
 
+
+
+// Challenge 2: sort sales-large.tsv by Date, and 10,000 generated rows
+await page.getByText('Sample 3k').click()
+await scenario(
+    'C2 sort: Sample 3k (2,990 data rows) by Date, ascending',
+    '',
+    "e.sortColumn(1, 'asc')",
+)
+await scenario(
+    'C2 sort: 10,000 generated rows (4 columns incl. a formula column) by a number column, descending',
+    `const e = window.__engine
+     e.clearAll()
+     const ups = [{ row: 0, col: 0, raw: 'id' }, { row: 0, col: 1, raw: 'n' }]
+     for (let r = 1; r <= 10000; r++) {
+         ups.push({ row: r, col: 0, raw: 'ID-' + r }, { row: r, col: 1, raw: String((r * 7919) % 10007) },
+                  { row: r, col: 2, raw: '$' + (r % 500) + '.00' }, { row: r, col: 3, raw: '=B' + (r + 1) + '*2' })
+     }
+     e.setCells(ups)`,
+    "e.sortColumn(1, 'desc')",
+)
 await browser.close()

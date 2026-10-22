@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
     cellSelection, selectionRange, moveSelection, extendTo, rowSelection, columnSelection, fillTarget,
 } from './selection.js'
+import { variableAxis } from './layout.js'
 
 const bounds = { rows: 10, cols: 5 }
 
@@ -35,5 +36,18 @@ describe('fillTarget', () => {
     it('shrinks when dragged back inside and is a no-op on the corner', () => {
         expect(fillTarget(src, 1, 0)).toEqual({ r1: 1, c1: 0, r2: 1, c2: 0 })
         expect(fillTarget(src, 2, 0)).toEqual(src)
+    })
+})
+
+describe('variableAxis', () => {
+    it('skips zero-size rows when hit-testing', () => {
+        const hidden = new Set([1, 2])
+        const axis = variableAxis(5, (i) => (hidden.has(i) ? 0 : 10))
+        expect(axis.total()).toBe(30)
+        expect([0, 3, 4].map(axis.offset)).toEqual([0, 10, 20])
+        expect(axis.indexAt(5)).toBe(0)
+        expect(axis.indexAt(10)).toBe(3)
+        expect(axis.indexAt(25)).toBe(4)
+        expect(axis.indexAt(999)).toBe(4)
     })
 })

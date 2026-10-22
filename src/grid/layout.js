@@ -1,6 +1,7 @@
-// Pixel geometry for the grid. Sizes are uniform for now; the variable
-// size version (prefix sums) will keep the same offset/size/indexAt/total
-// shape so the grid doesn't need to change.
+// Pixel geometry for the grid. An axis answers: where does row/column i
+// start (offset), how big is it (size), how long is everything (total), and
+// which one is at pixel px (indexAt). When every size is the default we use
+// plain multiplication; otherwise prefix sums with a binary search.
 
 export const HEADER_WIDTH = 50
 export const HEADER_HEIGHT = 26
@@ -52,4 +53,14 @@ export function variableAxis(count, sizeAt) {
         while (i > 0 && prefix[i + 1] === prefix[i]) i--
         return i
     }
+}
+
+// Pick the cheap axis when nothing is customised. customSize(i) returns a
+// size in px or null for the default; hidden is a Set of zero-size indices.
+export function buildAxis(count, defaultSize, { customSize = null, hidden = null } = {}) {
+    if (!customSize && (!hidden || hidden.size === 0)) return uniformAxis(count, defaultSize)
+    return variableAxis(count, (i) => {
+        if (hidden && hidden.has(i)) return 0
+        return (customSize && customSize(i)) ?? defaultSize
+    })
 }

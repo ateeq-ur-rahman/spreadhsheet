@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "perf": "node perf/measure.mjs"
+    "perf": "node perf/measure.mjs",
+    "perf:grid": "node perf/measure-grid.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",

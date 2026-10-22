@@ -62,6 +62,7 @@ async function scenario(name, setup, body) {
 
 // start from Sample 33, loaded with the toolbar button like a user would
 await page.getByText('Sample 33').click()
+await page.waitForFunction(() => window.__engine.getRaw(32, 0) === 'Total') // the sample loads asynchronously
 
 // Challenge 1: fill 5,000 cells
 await scenario(
@@ -79,6 +80,7 @@ await scenario(
 
 // Challenge 2: sort sales-large.tsv by Date, and 10,000 generated rows
 await page.getByText('Sample 3k').click()
+await page.waitForFunction(() => window.__engine.getRaw(2991, 0) === 'Total')
 await scenario(
     'C2 sort: Sample 3k (2,990 data rows) by Date, ascending',
     '',

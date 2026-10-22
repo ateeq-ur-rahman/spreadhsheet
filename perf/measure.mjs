@@ -137,4 +137,33 @@ const groupBy = await page.evaluate(() => {
     return { median: times[2], max: times[4] }
 })
 console.log(`\nC4 two-level group-by over 100,000 generated rows: median ${groupBy.median.toFixed(1)} ms, max ${groupBy.max.toFixed(1)} ms`)
+
+// Challenge 5: every golden format action on sales-large.tsv (totals row
+// 2,992), with the real canvas measure for auto-fit. Timed from the apply
+// call to the second frame after it, then undone so each run starts clean.
+const formats = JSON.parse(fs.readFileSync(new globalThis.URL('../fixtures/ai-eval/format-prompts.json', import.meta.url), 'utf8'))
+const perFormat = []
+for (const c of formats.cases) {
+    const apply = [], paint = []
+    let result = ''
+    for (let i = 0; i < RUNS; i++) {
+        const t = await page.evaluate(async (action) => {
+            const e = window.__engine
+            const t0 = performance.now()
+            const res = window.__ai.applyFormat(e, action, { measure: window.__ai.measureText })
+            const t1 = performance.now()
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+            const t2 = performance.now()
+            if (res.result === 'APPLIED') e.undo()
+            return { result: res.result, apply: t1 - t0, paint: t2 - t0 }
+        }, c.action)
+        apply.push(t.apply)
+        paint.push(t.paint)
+        result = t.result
+    }
+    perFormat.push({ id: c.id, result, apply: Math.max(...apply), paint: Math.max(...paint), applyMed: median(apply) })
+}
+console.log(`\nC5 golden format actions over sales-large.tsv (${RUNS} runs each, max ms: apply / to next paint)`)
+for (const f of perFormat) console.log(`  ${f.id} ${f.result.padEnd(12)} ${f.apply.toFixed(1)} / ${f.paint.toFixed(1)}  (apply median ${f.applyMed.toFixed(1)})`)
+console.log(`  slowest to next paint: ${Math.max(...perFormat.map(f => f.paint)).toFixed(1)} ms`)
 await browser.close()

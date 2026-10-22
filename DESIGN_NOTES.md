@@ -6,6 +6,7 @@
 - **Challenge 2: sort and filter** (`challenge-2-sort-filter`, built on Challenge 1). Rows and columns got stable ids, sort is a real edit that moves rows (and formulas follow them), and filters are a view that only hides rows.
 - **Challenge 3: virtualized grid** (`challenge-3-virtual-grid`, built on Challenge 2). The sheet is 100,000 × 200 and only what's on screen is rendered. Frozen first row/column use sticky panes. Column widths and row heights live in the engine, keyed by id. Adds the name box, Ctrl+Home/End, Page Up/Down and Ctrl+D.
 - **Challenge 4: ask your data** (`challenge-4-ask-data`, built on Challenge 3). Ctrl+K opens a side panel. A question goes to the model, which answers with a query plan; my own validator checks the plan, and my executor computes the result over the sheet. The live model is xAI Grok, called through a small `server/` proxy so the key never reaches the browser.
+- **Challenge 5: format with AI** (`challenge-5-format-ai`, built on Challenge 4). The same panel takes requests like "format this as a clean table". The model answers with a `format_sheet` action, the panel shows what it will do in plain words, and nothing touches the sheet until you press Apply. Then it goes through the engine's normal style system as one undo step. Cells now have a number format (General / Number / Currency / Percent / Date) that only changes what's shown, and the toolbar has a picker for it.
 
 ## Data model changes
 
@@ -168,6 +169,9 @@ Deleting rows records "insert them back, restore the deleted cells and styles, a
 | Ctrl+D / Ctrl+R | the whole fill |
 | Insert into sheet (AI result card) | the whole inserted table |
 | Re-run (AI result card) | nothing: it only reads the sheet, so it makes no undo entry |
+| Apply on an AI formatting card | the whole format action: styles, number formats, widths, freeze and auto-fit together ("AI format") |
+| Apply that changes nothing (`NO_CHANGES`, `OUT_OF_RANGE`), or Discard | nothing: no undo entry is made |
+| Format picker in the toolbar | the whole selection |
 
 ## UI
 
@@ -257,11 +261,21 @@ Ask your data (`npm run perf`, production build, same machine; each plan run 5 t
 | Two-level group-by over 100,000 generated rows under 500 ms | median 54.8 ms, max 61.1 ms (Region × Category, sum + avg, two-key sort) |
 | Panel stays responsive | the model call is async; our own work is a single synchronous step of at most ~30 ms on 3,000 rows |
 
+Format with AI (`npm run perf`, production build, same machine). Each of the 10 golden format actions applied to sales-large.tsv (2,990 data rows, totals row 2,992) through the panel's own `applyFormat` with the real canvas measure, 5 runs each, undone between runs:
+
+| Budget | Result |
+|---|---|
+| Apply on sales-large under 300 ms | all 10 pass. Slowest is f01 ("clean table": four column formats, header, totals row, freeze and auto-fit of 10 columns): apply max 178.6 ms, median 114.9 ms, 212.8 ms until the next frame is painted. f05 (body font size on every body cell) is next at 114.7 ms max. Everything else is under 26 ms. In Node, with a stub measure, the slowest was 51 ms. |
+
+On sales-large, f08 ("freeze the first 50 rows") is APPLIED, not OUT_OF_RANGE: the table has 2,992 rows, so 50 is fine there. f10's precondition (delete row 33) is for sales.tsv, so on sales-large it just bolds the real totals row.
+
+One fix came out of measuring: auto-fit measured every cell on a canvas, including the same "North" 750 times. It now remembers each text per style, which took f01 from 228 ms to 179 ms (apply max).
+
 For comparison, before these changes: loading Sample 3k and rendering it took 8.5 s (153,612 `<td>` elements), and inserting a row with 50,000 filled cells took 7.5 s in Node.
 
 ## Tests
 
-`npm test` runs 128 tests:
+`npm test` runs 180 tests:
 
 - `values.test.js`: how numbers, dates and text are read.
 - `formula.test.js`: parser, errors, fill translation, insert/delete rewriting, and regression tests for the bugs above.
@@ -275,9 +289,11 @@ For comparison, before these changes: loading Sample 3k and rendering it took 8.
 - `golden.queries.test.js`: all 20 cases in `fixtures/ai-eval/queries.json`, through the real path (mock provider → extract → validate → execute over `sales-large.tsv` loaded into the engine), compared as §5 says (columns exact, numbers ±0.01, order only when sorted, error codes exact). It also checks every plan runs in under 50 ms.
 - `ai.test.js`: JSON extraction (fences, prose, braces in strings, failure reasons), the validator, READ_ONLY / INVALID_RESPONSE, executor edge cases (normalised grouping, N/A, dates across formats, totals row, sort direction with blanks, the 500 cap, every error code), a two-level group-by over 100,000 rows, column type guessing, the context shape, plain-words plans.
 - `provider.test.js`: the http provider through the real server against a fake vendor (success, 401, 429, network, no key, server not running, errors reaching the pipeline).
+- `golden.format.test.js`: all 10 cases in `fixtures/ai-eval/format-prompts.json` on `sales.tsv`, through mock provider → extract → validate → `applyFormat`. Each `expect` entry is checked as written (styles, displayed text, raw value, frozen rows, result codes), and "one undo" means one Ctrl+Z puts every style, width and the freeze back exactly. Result codes also check that no undo entry was made. Then the same 10 actions on `sales-large.tsv`, checking the totals row is found at 2,992 and each apply is under 300 ms.
+- `display.test.js`: the number-format table from AI_CONTRACT §4, every cell of it, plus blanks, `$ 49.99`, negative money and errors.
 - `core.test.js`: the original starter tests, unchanged.
 
-I also drove the UI in the production build with Playwright using real mouse and keyboard input: Shift+Click, header clicks, fill-handle drags that scroll past the edge, F2, double-click, Escape, Delete then undo, Ctrl+A, and drag-select. For Challenge 2 the same script runs the acceptance flow through the ⇅ buttons and the filter menu: sort Total descending, filter Region to West (8 of 32 rows, gaps in the row numbers), sort by Units with hidden rows staying put, two undos, arrow keys skipping hidden rows, and a condition filter combined with the checklist. For Challenge 3 a third script freezes row 1, resizes D by dragging its border, inserts a column, scrolls, auto-fits a column, drags a row height, checks Ctrl+End / Ctrl+Home / Page Down, and undoes everything. The Challenge 1 and 2 scripts were re-run on the virtualized grid and still pass. For Challenge 4 a script loads Sample 3k, opens the panel with Ctrl+K, asks 12 golden prompts and checks each card's numbers against the golden file. It also uses Show plan, Re-run, Insert at M1 plus one undo, the READ_ONLY refusal and the unknown-column question.
+I also drove the UI in the production build with Playwright using real mouse and keyboard input: Shift+Click, header clicks, fill-handle drags that scroll past the edge, F2, double-click, Escape, Delete then undo, Ctrl+A, and drag-select. For Challenge 2 the same script runs the acceptance flow through the ⇅ buttons and the filter menu: sort Total descending, filter Region to West (8 of 32 rows, gaps in the row numbers), sort by Units with hidden rows staying put, two undos, arrow keys skipping hidden rows, and a condition filter combined with the checklist. For Challenge 3 a third script freezes row 1, resizes D by dragging its border, inserts a column, scrolls, auto-fits a column, drags a row height, checks Ctrl+End / Ctrl+Home / Page Down, and undoes everything. The Challenge 1 and 2 scripts were re-run on the virtualized grid and still pass. For Challenge 4 a script loads Sample 3k, opens the panel with Ctrl+K, asks 12 golden prompts and checks each card's numbers against the golden file. It also uses Show plan, Re-run, Insert at M1 plus one undo, the READ_ONLY refusal and the unknown-column question. For Challenge 5 a script loads Sample 33, types 8 format prompts into the panel (f01, f07, f08, f09, f03, f02, f05, then "Remove all formatting"), reads each preview, presses Apply (or Discard on the last one) and checks the status line and the undo label. Then Ctrl+Z on the grid undoes the last apply, and the toolbar picker sets Percent on the active cell. No console errors.
 
 ## AI
 
@@ -346,7 +362,7 @@ At most five sample rows, never the whole sheet. This is exactly what goes out f
 | wrong or missing API key | `PROVIDER_ERROR` (auth / no_key) | red card naming `XAI_API_KEY` in `.env.local` |
 | rate limited | `PROVIDER_ERROR` (rate_limit) | red card, with the retry-after hint when the vendor sends one |
 | no JSON, broken JSON, or a schema failure | `INVALID_RESPONSE` | red card with what failed (e.g. `$.limit must be integer, got number`) |
-| any action type other than `query`/`clarify` | `READ_ONLY` | "That would change the sheet. I can only read it." Checked before the schema, as §2.2 says. |
+| any action type other than `query`/`format_sheet`/`clarify` | `READ_ONLY` | "That would change the data. I can read it and format it, but not edit it." Checked before the schema, as §2.2 says. |
 | unknown column | `UNKNOWN_COLUMN` | a question back: "There's no column called "Territory". Which one did you mean?", with the real column names. It never picks a similar column. |
 | model asks something | `clarify` | the model's question |
 
@@ -363,6 +379,29 @@ Every card has Show plan / Hide plan, which shows the action JSON (or the raw re
   - **Re-run**: same plan, current data, no model call
   - **Insert into sheet**: asks for the top-left cell (defaults to the active cell); writes the header and rows as one transaction, labelled "Insert query result"
   - **Show plan**
+
+### Formatting
+
+```
+prompt ─▶ … same pipeline … ─▶ format_sheet action ─▶ preview card ─▶ Apply ─▶ applyFormat(engine, action) ─▶ one undo step
+                                                      (describeFormat,          (engine.transact('AI format'))
+                                                       nothing applied yet)
+```
+
+`src/ai/formatApplier.js` follows AI_CONTRACT §4 in order, and only uses the engine's public methods (`setStyle`, `clearStyles`, `setColWidth`, `setFrozen`, `autoFitColumns`), so it's the same style system the toolbar uses:
+
+1. Work out the sheet first: used range, column count (from the sheet, never from the action) and whether the last row is a totals row (the `Total`/`Totals`/`Subtotal`/`Sum` label, or the summary-line rule).
+2. A freeze that would cover every used row is refused with `OUT_OF_RANGE` before anything else runs.
+3. Then, inside one transaction: clear formatting, body style, each column (body rows only), totals style (only if there is a totals row), header style last (with any number format taken off), widths in 30..600, freeze if it differs, and auto-fit after everything so it measures the formatted text.
+4. If the engine's version didn't move, nothing changed: `NO_CHANGES`, and the engine never made an undo entry.
+
+Number formats are part of the cell style (`numberFormat`), so they move with sort, insert and delete like bold does. They only change the text you see (`src/engine/display.js`); the stored value is never rewritten, and formulas, sort, filter and the AI executor all keep using the real value. Auto-fit measures the formatted text.
+
+The preview card lists each change in plain words ("column H: right-aligned, currency format", "header: bold, grey background, center-aligned"), worked out against the sheet as it is when the card is shown. It says up front what will be skipped: "column Z: skipped (outside the 10-column table)", "totals row: skipped (the last row is not a totals row)", "freeze 50 rows: refused (the table only has 33 rows)". After Apply the card shows the result code and message; Discard leaves the sheet alone.
+
+Two places where the golden file and a literal reading disagree, and what I did:
+- **f03 names J22 as the blank Total, but J22 is ORD-1020's $3,344.00.** The blank one is J23 (ORD-1021). The test checks J23 and says why, and a separate test pins down which row is which. I left the fixture file as it was given.
+- **f06 ("Remove all formatting") expects one undo step**, but a freshly loaded sheet has no formatting, so clearing it changes nothing, and §4.7 says that's `NO_CHANGES` with no undo entry. The test formats the sheet first (f01) so the clear has something to do, and a second test checks the clean-sheet case is `NO_CHANGES`. f04 ("Unfreeze") has the same shape: on a fresh sheet nothing is frozen, so it's `NO_CHANGES`; a separate test freezes row 1 first and checks the unfreeze and its undo.
 
 ### Provider and the API key
 
@@ -394,6 +433,8 @@ Every card has Show plan / Hide plan, which shows the action JSON (or the raw re
 - Very long columns of formulas: the 100,000-row fill spends most of its time parsing the same formula shape 100,000 times; caching parsed ASTs by relative shape would make that much faster.
 - Row heights are adjustable but text doesn't wrap, so a taller row just has more space.
 - The AI executor runs on the main thread. It's 10–30 ms for 3,000 rows and about 55 ms for 100,000, fine for now. For much bigger sheets I'd move readTable + executeQuery into a Web Worker.
+- Body formatting on 3,000 rows (f05) takes about 100 ms because every cell gets its own style write. Row/column-level styles would make "format the whole body" one write per column.
+- The preview is text. A dry-run that shows the formatted cells before Apply would be nicer; the engine could do it by applying inside a transaction and rolling back, but I kept it simple.
 - A live model can still choose the wrong column for a vague question. The guard is that unknown names are refused and the plan is always visible, but I'd add a confirm step for plans whose filters match nothing.
 
 ## Use of AI tools

@@ -47,7 +47,9 @@ export async function complete({ system, user, history = [] }, { apiKey, model, 
     if (!res.ok) {
         const body = await res.text().catch(() => '')
         const short = body.slice(0, 300)
-        if (res.status === 401 || res.status === 403) throw new LlmError(401, 'auth', `The provider rejected the API key (HTTP ${res.status}). Check XAI_API_KEY in .env.local. ${short}`)
+                // xAI answers a wrong key with 400 "Incorrect API key", not 401, so look at the text too
+        const badKey = res.status === 401 || res.status === 403 || (res.status === 400 && /api key/i.test(body))
+        if (badKey) throw new LlmError(401, 'auth', `The provider rejected the API key (HTTP ${res.status}). Check XAI_API_KEY in .env.local. ${short}`)
         if (res.status === 429) {
             const retry = res.headers.get('retry-after')
             throw new LlmError(429, 'rate_limit', `Rate limited by the provider (HTTP 429)${retry ? `; try again in ${retry} s` : ''}. ${short}`)

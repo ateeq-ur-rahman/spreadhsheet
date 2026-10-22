@@ -253,3 +253,18 @@
   outline: none;
   border-color: #1a73e8;
 }
+
+.ai-format-lines {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  line-height: 1.5;
+}
+
+.ai-format-status {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.ai-format-status.ok { color: #137333; }
+.ai-format-status.bad { color: #c5221f; }
+.ai-format-status.muted { color: #5f6368; }

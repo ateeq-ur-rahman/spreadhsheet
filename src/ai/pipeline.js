@@ -7,13 +7,15 @@
 
 import { extractJson } from './extractJson.js'
 import { validate, describeErrors } from './validate.js'
-import { QUERY_PLAN_SCHEMA, CLARIFY_SCHEMA } from './contract.js'
+import { QUERY_PLAN_SCHEMA, CLARIFY_SCHEMA, FORMAT_SHEET_SCHEMA } from './contract.js'
 import { buildSystemPrompt } from './systemPrompt.js'
 
-export const DEFAULT_SCHEMAS = { query: QUERY_PLAN_SCHEMA, clarify: CLARIFY_SCHEMA }
+// The actions the panel accepts. Anything else (e.g. "mutation") is READ_ONLY.
+export const DEFAULT_SCHEMAS = { query: QUERY_PLAN_SCHEMA, format_sheet: FORMAT_SHEET_SCHEMA, clarify: CLARIFY_SCHEMA }
 
 // Result shapes:
 //   { kind: 'query', action, raw }
+//   { kind: 'format_sheet', action, raw }
 //   { kind: 'clarify', question, action, raw }
 //   { kind: 'error', error: 'PROVIDER_ERROR' | 'INVALID_RESPONSE' | 'READ_ONLY', detail, raw? }
 export async function requestAction({ provider, prompt, context, history = [], schemas = DEFAULT_SCHEMAS }) {

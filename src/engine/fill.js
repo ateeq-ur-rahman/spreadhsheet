@@ -102,9 +102,12 @@ function cyclic(seeds) {
     return (p) => seeds[mod(p, seeds.length)]
 }
 
-export function createSeries(seeds) {
+// { copy: true } skips the series detection and just repeats the seeds,
+// which is what Ctrl+D / Ctrl+R do.
+export function createSeries(seeds, { copy = false } = {}) {
     const n = seeds.length
     if (n === 0) return () => ''
+    if (copy) return cyclic(seeds)
     const info = seeds.map(classify)
     if (info.some(x => x === null)) return cyclic(seeds)
     const kind = info[0].kind

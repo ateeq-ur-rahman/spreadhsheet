@@ -13,6 +13,7 @@ import {
 import { sortKey, sortedOrder, isTotalsLabel, compileFilter, isEmptyFilter } from './sortFilter.js'
 import { parseNumberLiteral } from './values.js'
 import { normalizeRange } from './address.js'
+import { displayText } from './display.js'
 import { createSeries } from './fill.js'
 
 export const MAX_COLS = 16384
@@ -31,6 +32,7 @@ export const DEFAULT_STYLE = Object.freeze({
 const STYLE_KEYS = Object.keys(DEFAULT_STYLE)
 
 const keyOf = (row, col) => row * MAX_COLS + col
+const NO_HIDDEN_ROWS = new Set() // shared, never modified
 const rowOf = (key) => Math.floor(key / MAX_COLS)
 const colOf = (key) => key % MAX_COLS
 
@@ -61,12 +63,20 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     // Filters are a view: colId -> spec. Which rows are hidden is worked out
     // from the current values and cached until something changes.
     const filters = new Map()
-    let hiddenRows = new Set()
+    let hiddenRows = NO_HIDDEN_ROWS
     let hiddenDirty = true
 
     // { colId, dir, originalIds } while a sort is active. originalIds is the
     // block's row order before the first sort, for the "back to original" click.
     let sortState = null
+
+    // Column widths and row heights in px, keyed by id so they travel with
+    // their column/row on insert, delete and sort. Missing = default size.
+    // `frozen` is how many top rows / left columns stay put when scrolling.
+    const colWidths = new Map()
+    const rowHeights = new Map()
+    let frozen = { rows: 0, cols: 0 }
+    let sizeVersion = 0
 
     const undoStack = []
     const redoStack = []
@@ -433,6 +443,23 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         else filters.delete(colId)
     }
 
+    function writeSize(map, t, id, size) {
+        const old = map.get(id) ?? null
+        const next = size ?? null
+        if (old === next) return
+        record({ t, id, size: old })
+        if (next === null) map.delete(id)
+        else map.set(id, next)
+        sizeVersion++
+    }
+
+    function writeFreeze(r, c) {
+        if (frozen.rows === r && frozen.cols === c) return
+        record({ t: 'freeze', rows: frozen.rows, cols: frozen.cols })
+        frozen = { rows: r, cols: c }
+        sizeVersion++
+    }
+
     function writeSortState(state) {
         if (JSON.stringify(sortState) === JSON.stringify(state)) return
         record({ t: 'sortState', state: sortState })
@@ -447,6 +474,9 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             case 'permute': return permuteRows(op.r1, op.order)
             case 'filter': return writeFilter(op.colId, op.spec)
             case 'sortState': return writeSortState(op.state)
+            case 'colWidth': return writeSize(colWidths, 'colWidth', op.id, op.size)
+            case 'rowHeight': return writeSize(rowHeights, 'rowHeight', op.id, op.size)
+            case 'freeze': return writeFreeze(op.rows, op.cols)
             // placeholder so an action that changed nothing still gets an undo step
             case 'noop': return record(op)
             default: throw new Error('Unknown op ' + op.t)
@@ -626,7 +656,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     // ended. Target either grows the source in one direction (we fill the new
     // cells from the seeds and copy the seed styles) or shrinks it from the
     // bottom/right (we clear what got cut off).
-    function fill(source, target) {
+    function fill(source, target, { copy = false } = {}) {
         const s = normalizeRange(source)
         const t = normalizeRange(target)
         const sameCols = t.c1 === s.c1 && t.c2 === s.c2
@@ -671,7 +701,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
                     seeds.push(getRaw(r, c))
                     seedStyles.push(styles.get(keyOf(r, c)) || null)
                 }
-                const series = createSeries(seeds)
+                const series = createSeries(seeds, { copy })
                 const from = vertical ? (dir === 'down' ? s.r2 + 1 : t.r1) : (dir === 'right' ? s.c2 + 1 : t.c1)
                 const to = vertical ? (dir === 'down' ? t.r2 : s.r1 - 1) : (dir === 'right' ? t.c2 : s.c1 - 1)
                 const origin = vertical ? s.r1 : s.c1
@@ -714,8 +744,11 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     function getHiddenRows() {
         if (!hiddenDirty) return hiddenRows
         hiddenDirty = false
+        if (filters.size === 0) {
+            hiddenRows = NO_HIDDEN_ROWS // same object every time, so the UI can memoize on it
+            return hiddenRows
+        }
         hiddenRows = new Set()
-        if (filters.size === 0) return hiddenRows
         const used = getUsedRange()
         if (!used) return hiddenRows
         const tests = []
@@ -864,6 +897,52 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         transact('Forget sort', () => writeSortState(null))
     }
 
+    // Sizes and frozen panes
+
+    const asList = (x) => (Array.isArray(x) ? x : [x])
+
+    // width null = back to the default. One undo step for all the columns.
+    function setColWidth(cols, width) {
+        transact('Column width', () => {
+            for (const c of asList(cols)) writeSize(colWidths, 'colWidth', colIds[c], width)
+        })
+    }
+
+    function setRowHeight(rowList, height) {
+        transact('Row height', () => {
+            for (const r of asList(rowList)) writeSize(rowHeights, 'rowHeight', rowIds[r], height)
+        })
+    }
+
+    // Fit columns to their widest cell text. The engine can't measure text
+    // itself (no DOM here), so the caller passes measure(text, style) -> px.
+    // Widths are clamped to 30..600, like the format action. One undo step.
+    function autoFitColumns(cols, measure, { padding = 16, min = 30, max = 600 } = {}) {
+        const used = getUsedRange()
+        const widths = {}
+        transact('Auto-fit columns', () => {
+            for (const c of asList(cols)) {
+                let widest = 0
+                if (used) {
+                    for (let r = 0; r <= used.r2; r++) {
+                        const cell = getCell(r, c)
+                        if (cell.raw === '') continue
+                        const w = measure(displayText(cell, getStyle(r, c)), getStyle(r, c))
+                        if (w > widest) widest = w
+                    }
+                }
+                const width = Math.round(Math.min(max, Math.max(min, widest + padding)))
+                widths[c] = width
+                writeSize(colWidths, 'colWidth', colIds[c], width)
+            }
+        })
+        return widths
+    }
+
+    function setFrozen(r, c) {
+        transact(r || c ? 'Freeze panes' : 'Unfreeze panes', () => writeFreeze(r, c))
+    }
+
     return {
         get rows() { return rows },
         get cols() { return cols },
@@ -914,6 +993,17 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         filterStatus,
         isRowHidden: (r) => getHiddenRows().has(r),
         getHiddenRows,
+        // bumps when a width, height or the frozen panes change
+        get sizeVersion() { return sizeVersion },
+        getColWidth: (c) => colWidths.get(colIds[c]) ?? null,
+        getRowHeight: (r) => rowHeights.get(rowIds[r]) ?? null,
+        hasCustomColWidths: () => colWidths.size > 0,
+        hasCustomRowHeights: () => rowHeights.size > 0,
+        setColWidth,
+        setRowHeight,
+        autoFitColumns,
+        getFrozen: () => frozen,
+        setFrozen,
         subscribe(fn) {
             listeners.add(fn)
             return () => listeners.delete(fn)

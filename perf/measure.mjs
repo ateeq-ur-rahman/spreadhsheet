@@ -11,6 +11,7 @@
 // Uses playwright-core, which doesn't download a browser. Point it at one
 // with --browser or CHROME_PATH.
 import { chromium } from 'playwright-core'
+import fs from 'node:fs'
 
 const args = Object.fromEntries(
     process.argv.slice(2).reduce((acc, a, i, all) => {
@@ -98,4 +99,42 @@ await scenario(
      e.setCells(ups)`,
     "e.sortColumn(1, 'desc')",
 )
+
+// Challenge 4: every golden plan over sales-large.tsv, and a two-level
+// group-by over 100,000 generated rows. Ctrl+K loads the AI module.
+await page.getByText('Sample 3k').click()
+await page.waitForFunction(() => window.__engine.getRaw(2991, 0) === 'Total')
+await page.keyboard.press('Control+k')
+await page.waitForFunction(() => window.__ai)
+const golden = JSON.parse(fs.readFileSync(new globalThis.URL('../fixtures/ai-eval/queries.json', import.meta.url), 'utf8'))
+const plans = golden.cases.filter(c => c.plan.type === 'query').map(c => ({ id: c.id, plan: c.plan }))
+const perPlan = await page.evaluate((plans) => plans.map(({ id, plan }) => {
+    const times = []
+    for (let i = 0; i < 5; i++) {
+        const t0 = performance.now()
+        window.__ai.executeQuery(plan, window.__ai.readTable(window.__engine))
+        times.push(performance.now() - t0)
+    }
+    times.sort((a, b) => a - b)
+    return { id, median: times[2], max: times[4] }
+}), plans)
+console.log('\nC4 golden plans over sales-large.tsv (read table + execute, 5 runs each)')
+console.log('  ' + perPlan.map(p => `${p.id} ${p.median.toFixed(1)}/${p.max.toFixed(1)}`).join(', ') + '  (median/max ms)')
+console.log(`  slowest max: ${Math.max(...perPlan.map(p => p.max)).toFixed(1)} ms`)
+const groupBy = await page.evaluate(() => {
+    const regions = ['North', 'South', 'East', 'West', 'Central']
+    const cats = ['Electronics', 'Furniture', 'Accessories', 'Software']
+    const rows = Array.from({ length: 100000 }, (_, i) => [regions[i % 5], String((i * 13) % 97), '$' + ((i % 1000) + 0.5), cats[(i * 7) % 4]])
+    const table = { headers: ['Region', 'Units', 'Total', 'Category'], rows, totalsRow: null, range: { r1: 0, c1: 0, r2: 100000, c2: 3 } }
+    const plan = { type: 'query', groupBy: ['Region', 'Category'], aggregates: [{ fn: 'sum', column: 'Total', as: 'Sales' }, { fn: 'avg', column: 'Units', as: 'Avg units' }], sort: [{ column: 'Region' }, { column: 'Sales', dir: 'desc' }] }
+    const times = []
+    for (let i = 0; i < 5; i++) {
+        const t0 = performance.now()
+        window.__ai.executeQuery(plan, table)
+        times.push(performance.now() - t0)
+    }
+    times.sort((a, b) => a - b)
+    return { median: times[2], max: times[4] }
+})
+console.log(`\nC4 two-level group-by over 100,000 generated rows: median ${groupBy.median.toFixed(1)} ms, max ${groupBy.max.toFixed(1)} ms`)
 await browser.close()

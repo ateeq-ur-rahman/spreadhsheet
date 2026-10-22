@@ -5,6 +5,7 @@
 - **Challenge 1: range selection and fill handle** (`challenge-1-fill-handle`). Before the fill handle could work I had to fix the engine underneath it: the formula parser couldn't parse ranges, recalc redid everything on every edit, and undo didn't group anything. So this branch also carries the engine groundwork the later challenges build on.
 - **Challenge 2: sort and filter** (`challenge-2-sort-filter`, built on Challenge 1). Rows and columns got stable ids, sort is a real edit that moves rows (and formulas follow them), and filters are a view that only hides rows.
 - **Challenge 3: virtualized grid** (`challenge-3-virtual-grid`, built on Challenge 2). The sheet is 100,000 × 200 and only what's on screen is rendered. Frozen first row/column use sticky panes. Column widths and row heights live in the engine, keyed by id. Adds the name box, Ctrl+Home/End, Page Up/Down and Ctrl+D.
+- **Challenge 4: ask your data** (`challenge-4-ask-data`, built on Challenge 3). Ctrl+K opens a side panel. A question goes to the model, which answers with a query plan; my own validator checks the plan, and my executor computes the result over the sheet. The live model is xAI Grok, called through a small `server/` proxy so the key never reaches the browser.
 
 ## Data model changes
 
@@ -165,6 +166,8 @@ Deleting rows records "insert them back, restore the deleted cells and styles, a
 | Double-click a column border (auto-fit), double-click a row border (reset height) | that change |
 | ❄ Row 1 / ❄ Col A | the freeze change |
 | Ctrl+D / Ctrl+R | the whole fill |
+| Insert into sheet (AI result card) | the whole inserted table |
+| Re-run (AI result card) | nothing: it only reads the sheet, so it makes no undo entry |
 
 ## UI
 
@@ -246,11 +249,19 @@ I checked that canvas size (1,000 vs 100,000 rows; 20 vs 200 columns), fonts, em
 
 Acceptance (also scripted with Playwright on the production build): freeze row 1, drag D's border to 300 px, insert a column before D. Result: new D at the default width (`getColWidth` null), old D (now E) at 300 px with its data. Row 1 stays under the column headers while scrolling. Five undos take it all back.
 
+Ask your data (`npm run perf`, production build, same machine; each plan run 5 times in the page with the panel's own `readTable` + `executeQuery`):
+
+| Budget | Result |
+|---|---|
+| Any golden plan over sales-large.tsv under 50 ms | all 19 query plans pass; slowest single run 30.3 ms (q02), medians 9–23 ms. This includes reading the table out of the engine each time. In Node the slowest was 13.6 ms. |
+| Two-level group-by over 100,000 generated rows under 500 ms | median 54.8 ms, max 61.1 ms (Region × Category, sum + avg, two-key sort) |
+| Panel stays responsive | the model call is async; our own work is a single synchronous step of at most ~30 ms on 3,000 rows |
+
 For comparison, before these changes: loading Sample 3k and rendering it took 8.5 s (153,612 `<td>` elements), and inserting a row with 50,000 filled cells took 7.5 s in Node.
 
 ## Tests
 
-`npm test` runs 83 tests:
+`npm test` runs 128 tests:
 
 - `values.test.js`: how numbers, dates and text are read.
 - `formula.test.js`: parser, errors, fill translation, insert/delete rewriting, and regression tests for the bugs above.
@@ -261,14 +272,114 @@ For comparison, before these changes: loading Sample 3k and rendering it took 8.
 - `sortFilter.test.js`: the comparator, filter conditions, totals label, sort cycling, formulas and styles following rows, selection sorts, filters with AND, distinct values, filters surviving a column insert, row ids on undo.
 - `acceptance.challenge2.test.js`: the Challenge 2 checks on `sales.tsv` (Total descending with K = J/G, West filter then Units sort, undo twice).
 - `acceptance.challenge3.test.js`: K2:K100000 filled on `sales-large.tsv` (and editing J95000 updates K95000), freeze + resize D + insert column, row heights through sort/insert/delete, auto-fit clamping, Ctrl+D copying.
+- `golden.queries.test.js`: all 20 cases in `fixtures/ai-eval/queries.json`, through the real path (mock provider → extract → validate → execute over `sales-large.tsv` loaded into the engine), compared as §5 says (columns exact, numbers ±0.01, order only when sorted, error codes exact). It also checks every plan runs in under 50 ms.
+- `ai.test.js`: JSON extraction (fences, prose, braces in strings, failure reasons), the validator, READ_ONLY / INVALID_RESPONSE, executor edge cases (normalised grouping, N/A, dates across formats, totals row, sort direction with blanks, the 500 cap, every error code), a two-level group-by over 100,000 rows, column type guessing, the context shape, plain-words plans.
+- `provider.test.js`: the http provider through the real server against a fake vendor (success, 401, 429, network, no key, server not running, errors reaching the pipeline).
 - `core.test.js`: the original starter tests, unchanged.
 
-I also drove the UI in the production build with Playwright using real mouse and keyboard input: Shift+Click, header clicks, fill-handle drags that scroll past the edge, F2, double-click, Escape, Delete then undo, Ctrl+A, and drag-select. For Challenge 2 the same script runs the acceptance flow through the ⇅ buttons and the filter menu: sort Total descending, filter Region to West (8 of 32 rows, gaps in the row numbers), sort by Units with hidden rows staying put, two undos, arrow keys skipping hidden rows, and a condition filter combined with the checklist. For Challenge 3 a third script freezes row 1, resizes D by dragging its border, inserts a column, scrolls, auto-fits a column, drags a row height, checks Ctrl+End / Ctrl+Home / Page Down, and undoes everything. The Challenge 1 and 2 scripts were re-run on the virtualized grid and still pass.
+I also drove the UI in the production build with Playwright using real mouse and keyboard input: Shift+Click, header clicks, fill-handle drags that scroll past the edge, F2, double-click, Escape, Delete then undo, Ctrl+A, and drag-select. For Challenge 2 the same script runs the acceptance flow through the ⇅ buttons and the filter menu: sort Total descending, filter Region to West (8 of 32 rows, gaps in the row numbers), sort by Units with hidden rows staying put, two undos, arrow keys skipping hidden rows, and a condition filter combined with the checklist. For Challenge 3 a third script freezes row 1, resizes D by dragging its border, inserts a column, scrolls, auto-fits a column, drags a row height, checks Ctrl+End / Ctrl+Home / Page Down, and undoes everything. The Challenge 1 and 2 scripts were re-run on the virtualized grid and still pass. For Challenge 4 a script loads Sample 3k, opens the panel with Ctrl+K, asks 12 golden prompts and checks each card's numbers against the golden file. It also uses Show plan, Re-run, Insert at M1 plus one undo, the READ_ONLY refusal and the unknown-column question.
 
 ## AI
 
-Not started yet (Challenges 4 and 5).
+### How a question becomes a table
 
+```
+prompt ─▶ provider.complete ─▶ extractJson ─▶ type check ─▶ validate(schema) ─▶ executeQuery(plan, readTable(engine)) ─▶ result card
+            (mock or http)      (prose,        (non-query      (my own            (pure; every number
+                                 fences)        = READ_ONLY)    validator)          is computed here)
+```
+
+The model only ever produces the plan. Everything after that runs in our code and is deterministic, so Re-run executes the same plan again on the current data without calling the model.
+
+All the pieces in `src/ai/` except the panel are pure functions with no React:
+
+| File | What it does |
+|---|---|
+| `extractJson.js` | finds the first complete `{...}` in the reply, skipping braces inside strings; tries the next `{` if one isn't JSON. Says why it failed (no JSON / not closed / the parse error). |
+| `validate.js` | my JSON Schema validator, covering only the keywords `contract.js` uses: `type` (incl. lists and `integer`), `const`, `enum`, `required`, `properties`, `additionalProperties: false`, `items`, `minimum`, `maximum`, `pattern`. Returns every problem with its path, e.g. `$.filters[0].op must be one of eq, neq, …`. |
+| `pipeline.js` | `requestAction()` runs provider → extract → type check → validate. `parseAction()` is the text-only half. Every failure comes back as a value `{ kind: 'error', error, detail }`; nothing is swallowed. |
+| `sheetTable.js` | `readTable(engine)`: header row, data rows as text (typed values exactly as stored; formulas as their computed value), blank rows dropped, the totals row kept aside. |
+| `executor.js` | `executeQuery(plan, table)`, following AI_CONTRACT §3 clause by clause (comments point at the clauses). |
+| `context.js` | `buildContext(table, selection)`: what the model may see (below). |
+| `systemPrompt.js` | instructions, schemas, rules and the context. |
+| `describePlan.js` | the plan in plain words, built from the plan itself, so it always matches what ran. |
+| `provider.js` | `createProvider()`: `mock` (default) or `http`. |
+
+### Context sent to the model
+
+At most five sample rows, never the whole sheet. This is exactly what goes out for `sales.tsv` with C2:C10 selected (`sampleRows` cut to two here, and some columns left out):
+
+```json
+{
+  "range": "A1:J33",
+  "rowCount": 30,
+  "columns": [
+    { "name": "Order ID", "index": 0, "type": "id", "examples": ["ORD-1001", "ORD-1002", "ORD-1003"] },
+    { "name": "Date", "index": 1, "type": "date", "examples": ["2024-01-03", "2024-01-05", "1/8/2024"] },
+    { "name": "Region", "index": 2, "type": "text", "examples": ["North", "West", "East"] },
+    { "name": "Units", "index": 6, "type": "number", "examples": ["4", "12", "6"] },
+    { "name": "Unit Price", "index": 7, "type": "currency", "examples": ["$1,200.00", "$189.50", "$320.00"] },
+    { "name": "Discount", "index": 8, "type": "percent", "examples": ["10%", "5%", "15%"] },
+    { "name": "Total", "index": 9, "type": "currency", "examples": ["$4,320.00", "…"] }
+  ],
+  "sampleRows": [["ORD-1001", "2024-01-03", "North", "Aarav Shah", "Laptop Pro", "Electronics", "4", "$1,200.00", "10%", "$4,320.00"], ["…"]],
+  "selection": "C2:C10",
+  "hasTotalsRow": true
+}
+```
+
+- `rowCount` is the number of data rows: no header, no blank rows, no totals row.
+- Column types are guessed from up to 200 rows:
+  - date: 80% parse as one of the three date formats
+  - percent / currency: half end in `%` / start with `$`, and 70% read as numbers (messy columns have the odd `n/a`)
+  - number: 80% read as numbers
+  - id: letters and digits like `ORD-1001`, nearly all different
+  - text: anything else
+- The context goes in the **system** message and the user turn is just the user's words. The mock provider looks prompts up by their exact text, so this keeps one code path for the mock and the live model. The contract's envelope (system prompt + user turn + history) is otherwise unchanged.
+- Follow-up questions also send the last 4 exchanges as history.
+
+### Failures and what you see
+
+| Situation | Code | Shown |
+|---|---|---|
+| network down, server not running, vendor unreachable | `PROVIDER_ERROR` (network) | red card: the message says what to start or check |
+| wrong or missing API key | `PROVIDER_ERROR` (auth / no_key) | red card naming `XAI_API_KEY` in `.env.local` |
+| rate limited | `PROVIDER_ERROR` (rate_limit) | red card, with the retry-after hint when the vendor sends one |
+| no JSON, broken JSON, or a schema failure | `INVALID_RESPONSE` | red card with what failed (e.g. `$.limit must be integer, got number`) |
+| any action type other than `query`/`clarify` | `READ_ONLY` | "That would change the sheet. I can only read it." Checked before the schema, as §2.2 says. |
+| unknown column | `UNKNOWN_COLUMN` | a question back: "There's no column called "Territory". Which one did you mean?", with the real column names. It never picks a similar column. |
+| model asks something | `clarify` | the model's question |
+
+Every card has Show plan / Hide plan, which shows the action JSON (or the raw reply when there was no valid JSON).
+
+### Panel
+
+- Ctrl+K (or ✨ Ask) toggles it. It's lazy-loaded, so it doesn't cost anything at first paint.
+- Prompt box: Enter asks, Shift+Enter starts a new line. The conversation scrolls above it.
+- A result card shows:
+  - the plan in plain words
+  - the row count, saying when more rows matched than the 500 shown
+  - the table
+  - **Re-run**: same plan, current data, no model call
+  - **Insert into sheet**: asks for the top-left cell (defaults to the active cell); writes the header and rows as one transaction, labelled "Insert query result"
+  - **Show plan**
+
+### Provider and the API key
+
+- **mock** (default, `VITE_AI_PROVIDER=mock`): the repo's deterministic provider. No key, no network, works offline. The golden tests use it.
+- **http** (`VITE_AI_PROVIDER=http`): the browser posts `{ system, user, history }` to `/api/ai/complete`. Vite proxies `/api` to `npm run server` (port 8787) in dev and in preview. The server (`server/index.mjs`, no dependencies) reads `XAI_API_KEY`, `XAI_MODEL` (default `grok-4.7`) and `XAI_BASE_URL` (default `https://api.x.ai/v1`) from `.env.local` / `.env`. It calls `POST /chat/completions` with plain `fetch` and returns `{ text }`.
+  - The key never appears in a `VITE_*` variable, the bundle or the browser.
+  - `.env.local` is git-ignored.
+  - The vendor is named only in `server/llm.mjs`.
+- I picked xAI because you asked for Grok. I checked xAI's docs for the model: `grok-4.7` is listed as the current flagship. Chat Completions is marked "legacy" there (new features go to their Responses API first), but it is still documented with no shutdown date, so it's fine for a single-turn JSON task. Changing `XAI_MODEL` needs no code change.
+- To try it: put `XAI_API_KEY=…` in `.env.local`, set `VITE_AI_PROVIDER=http`, run `npm run server` in one terminal and `npm run dev` in another. `GET /api/ai/health` reports the model and whether a key is set.
+- I have no key in my environment, so the live call is tested against a fake vendor that answers like the real API: success, 401, 429 with retry-after, network failure, no key, and our server not running. I haven't seen a real Grok answer yet.
+
+### Where I made a call the golden set doesn't decide
+
+- **Descending sort with non-numbers.** §3.5 says "numbers before non-numbers". I keep that in both directions, so blanks and text stay at the end of a descending sort; the direction flips only number-vs-number and text-vs-text comparisons. None of the golden cases sorts a column with blanks, so they pass either way.
+- **Row results are text.** Rows return the cell text exactly as stored (`"28"`, `"15 %"`, `"$68,400.00"`), as the golden `rowsPreview` shows. Group labels are the trimmed text of the first row in the group, and aggregates are numbers rounded to 2 decimals.
+- **Column names in the result** use the header's own spelling (`Region`) even if the plan wrote `region`.
 ## Trade-offs and what I'd do next
 
 - Formatting a whole column writes one style entry per cell. They share one object, so it's cheap, but row- and column-level formatting would be better.
@@ -282,6 +393,8 @@ Not started yet (Challenges 4 and 5).
 - Each wheel event re-renders the Grid component (cheap, since the cell blocks are memoized). A pure-DOM scroll layer that only re-renders when the window moves past the overscan would cut that further.
 - Very long columns of formulas: the 100,000-row fill spends most of its time parsing the same formula shape 100,000 times; caching parsed ASTs by relative shape would make that much faster.
 - Row heights are adjustable but text doesn't wrap, so a taller row just has more space.
+- The AI executor runs on the main thread. It's 10–30 ms for 3,000 rows and about 55 ms for 100,000, fine for now. For much bigger sheets I'd move readTable + executeQuery into a Web Worker.
+- A live model can still choose the wrong column for a vague question. The guard is that unknown names are refused and the plan is always visible, but I'd add a confirm step for plans whose filters match nothing.
 
 ## Use of AI tools
 

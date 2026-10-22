@@ -1,15 +1,16 @@
 import { useState, useSyncExternalStore } from 'react'
 import './App.css'
 import { createEngine } from './engine/core.js'
-import { toA1, rangeToA1 } from './engine/address.js'
-import { loadSampleSmall, loadSampleLarge } from './fixtures/loadSample.js'
+import { toA1, rangeToA1, parseRange } from './engine/address.js'
 import Grid from './grid/Grid.jsx'
 import { createEditStore } from './grid/editStore.js'
 import { commitEdit, cancelEdit } from './grid/editing.js'
-import { cellSelection, selectionRange } from './grid/selection.js'
+import FormulaBar from './grid/FormulaBar.jsx'
+import { cellSelection, selectionRange, rangeSelection } from './grid/selection.js'
+import { counters } from './grid/perfCounters.js'
 
-const TOTAL_ROWS = 50
-const TOTAL_COLS = 50
+const TOTAL_ROWS = 100000
+const TOTAL_COLS = 200
 
 const clampSelection = (sel, rows, cols) => {
   const fix = (p) => ({ r: Math.min(p.r, rows - 1), c: Math.min(p.c, cols - 1) })
@@ -22,13 +23,20 @@ export default function App() {
   const [engine] = useState(() => {
     const e = createEngine(TOTAL_ROWS, TOTAL_COLS)
     // ?debug exposes the engine for perf/measure.mjs
-    if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug')) window.__engine = e
+    if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug')) {
+      window.__engine = e
+      window.__counters = counters
+    }
     return e
   })
   const [editStore] = useState(createEditStore)
   const version = useSyncExternalStore(engine.subscribe, () => engine.version)
-  const editState = useSyncExternalStore(editStore.subscribe, editStore.get)
   const [rawSelection, setSelection] = useState(() => cellSelection(0, 0))
+  // { r, c } the grid should scroll to (a new object each time we ask)
+  const [reveal, setReveal] = useState(null)
+  // name box: null while it just shows the selection, the typed text while editing
+  const [nameDraft, setNameDraft] = useState(null)
+  const [nameError, setNameError] = useState(false)
 
   const selection = clampSelection(rawSelection, engine.rows, engine.cols)
   const range = selectionRange(selection)
@@ -40,27 +48,6 @@ export default function App() {
   const applyStyle = (patch) => engine.setStyle(range, patch)
   const toggle = (prop) => applyStyle({ [prop]: !activeStyle[prop] })
 
-  // formula bar
-
-  const formulaBarValue = editState.editing ? editState.value : engine.getRaw(active.r, active.c)
-
-  const handleFormulaBarFocus = () => {
-    if (!editState.editing) editStore.start(active.r, active.c, engine.getRaw(active.r, active.c), 'edit')
-  }
-
-  const handleFormulaBarKeyDown = (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      const cell = commitEdit(engine, editStore)
-      if (cell) setSelection(cellSelection(Math.min(cell.r + 1, engine.rows - 1), cell.c))
-      e.currentTarget.blur()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      cancelEdit(editStore)
-      e.currentTarget.blur()
-    }
-  }
-
   // insert/delete use however many rows or columns are selected
 
   const rowCount = range.r2 - range.r1 + 1
@@ -70,17 +57,48 @@ export default function App() {
   const insertCols = () => engine.insertColumn(range.c1, colCount)
   const deleteCols = () => engine.deleteColumn(range.c1, Math.min(colCount, engine.cols - 1))
 
-  const loadSample = (loader) => {
+  const goTo = (sel) => {
+    setSelection(sel)
+    setReveal({ r: sel.anchor.r, c: sel.anchor.c })
+  }
+
+  // The sample files are about 250 KB of text, so they're only downloaded
+  // when a sample button is clicked (keeps the first paint fast).
+  const loadSample = async (which) => {
     cancelEdit(editStore)
-    loader(engine)
-    setSelection(cellSelection(0, 0))
+    const samples = await import('./fixtures/loadSample.js')
+    if (which === 'large') samples.loadSampleLarge(engine)
+    else samples.loadSampleSmall(engine)
+    goTo(cellSelection(0, 0))
   }
 
   const clearAll = () => {
     cancelEdit(editStore)
     engine.clearAll()
-    setSelection(cellSelection(0, 0))
+    goTo(cellSelection(0, 0))
   }
+
+  // name box: type A1, AZ5000 or K2:K100000 and press Enter
+  const handleNameKeyDown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      const target = parseRange(nameDraft ?? '')
+      if (!target || target.r2 >= engine.rows || target.c2 >= engine.cols) {
+        setNameError(true) // say so instead of silently ignoring it
+        return
+      }
+      setNameError(false)
+      setNameDraft(null)
+      goTo(rangeSelection(target))
+      document.querySelector('[data-testid="grid"]')?.focus({ preventScroll: true })
+    } else if (e.key === 'Escape') {
+      setNameDraft(null)
+      setNameError(false)
+      e.currentTarget.blur()
+    }
+  }
+
+  const frozen = engine.getFrozen()
 
   const filterInfo = engine.filterStatus()
 
@@ -163,21 +181,35 @@ export default function App() {
           </div>
 
           <div className="toolbar-group">
-            <button className="toolbar-btn" onClick={() => loadSample(loadSampleSmall)} title="Load fixtures/sales.tsv (33 rows) at A1">⬇ Sample 33</button>
-            <button className="toolbar-btn" onClick={() => loadSample(loadSampleLarge)} title="Load fixtures/sales-large.tsv (~3,000 rows) at A1">⬇ Sample 3k</button>
+            <button className={`toolbar-btn ${frozen.rows ? 'active' : ''}`} onClick={() => engine.setFrozen(frozen.rows ? 0 : 1, frozen.cols)} title="Keep row 1 in view while scrolling">❄ Row 1</button>
+            <button className={`toolbar-btn ${frozen.cols ? 'active' : ''}`} onClick={() => engine.setFrozen(frozen.rows, frozen.cols ? 0 : 1)} title="Keep column A in view while scrolling">❄ Col A</button>
+          </div>
+
+          <div className="toolbar-group">
+            <button className="toolbar-btn" onClick={() => loadSample('small')} title="Load fixtures/sales.tsv (33 rows) at A1">⬇ Sample 33</button>
+            <button className="toolbar-btn" onClick={() => loadSample('large')} title="Load fixtures/sales-large.tsv (~3,000 rows) at A1">⬇ Sample 3k</button>
           </div>
         </div>
 
         {/* Formula Bar */}
         <div className="formula-bar">
-          <span className="formula-bar-label" data-testid="selection-label">{status}</span>
           <input
-            className="formula-bar-input"
-            value={formulaBarValue}
-            onChange={(e) => editStore.setValue(e.target.value)}
-            onKeyDown={handleFormulaBarKeyDown}
-            onFocus={handleFormulaBarFocus}
-            placeholder="Select a cell then type, or enter a formula like =SUM(A1:A5)"
+            className={`name-box ${nameError ? 'error' : ''}`}
+            data-testid="name-box"
+            value={nameDraft ?? (range.r1 === range.r2 && range.c1 === range.c2 ? toA1(active.r, active.c) : rangeToA1(range))}
+            onFocus={(e) => { setNameDraft(e.target.value); e.target.select() }}
+            onChange={(e) => { setNameDraft(e.target.value); setNameError(false) }}
+            onBlur={() => { setNameDraft(null); setNameError(false) }}
+            onKeyDown={handleNameKeyDown}
+            title={nameError ? 'Not a cell or range on this sheet (try A1, AZ5000 or K2:K100000)' : 'Go to a cell or range'}
+            spellCheck={false}
+          />
+          <span className="formula-bar-label" data-testid="selection-label">{status}</span>
+          <FormulaBar
+            engine={engine}
+            editStore={editStore}
+            active={active}
+            onCommitted={(cell) => setSelection(cellSelection(Math.min(cell.r + 1, engine.rows - 1), cell.c))}
           />
         </div>
 
@@ -189,6 +221,7 @@ export default function App() {
           onSelectionChange={setSelection}
           editStore={editStore}
           onFormat={toggle}
+          reveal={reveal}
         />
 
         <div className="footer-hint status-line">
@@ -199,7 +232,7 @@ export default function App() {
             </span>
           )}
           <span>
-            Click to select · drag / Shift+Click / Shift+Arrow to extend · double-click, Enter, F2 or type to edit · drag the ■ handle to fill · ⇅ sorts, ▾ filters · Ctrl+Z / Ctrl+Y
+            Drag / Shift+Click / Shift+Arrow to select · double-click, Enter, F2 or type to edit · drag ■ to fill, Ctrl+D fills down · ⇅ sorts, ▾ filters · drag a header border to resize, double-click to fit · name box: A1, K2:K100000
           </span>
         </div>
       </div>

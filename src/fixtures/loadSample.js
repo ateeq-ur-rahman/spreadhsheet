@@ -20,7 +20,12 @@ export function loadTsv(engine, text, label = 'Load sample') {
             updates.push({ row: r, col: c, raw: rows[r][c] })
         }
     }
-    engine.setCells(updates, label)
+    // a fresh load also drops any filter or sort left over from before
+    engine.transact(label, () => {
+        engine.clearFilters()
+        engine.clearSortState()
+        engine.setCells(updates)
+    })
     return { rows: rows.length, cols }
 }
 

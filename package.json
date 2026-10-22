@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "perf": "node perf/measure.mjs",
-    "perf:grid": "node perf/measure-grid.mjs"
+    "perf:grid": "node perf/measure-grid.mjs",
+    "server": "node server/index.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",

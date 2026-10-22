@@ -920,6 +920,17 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     function autoFitColumns(cols, measure, { padding = 16, min = 30, max = 600 } = {}) {
         const used = getUsedRange()
         const widths = {}
+        // Columns repeat a lot ("North", "Electronics", "$49.99"), and
+        // measuring on a canvas isn't free, so remember each text per style.
+        // Styles are interned, so the style object itself is a fine key.
+        const seen = new Map()
+        const measured = (text, style) => {
+            let byText = seen.get(style)
+            if (!byText) seen.set(style, (byText = new Map()))
+            let w = byText.get(text)
+            if (w === undefined) byText.set(text, (w = measure(text, style)))
+            return w
+        }
         transact('Auto-fit columns', () => {
             for (const c of asList(cols)) {
                 let widest = 0
@@ -927,7 +938,8 @@ export function createEngine(initialRows = 50, initialCols = 50) {
                     for (let r = 0; r <= used.r2; r++) {
                         const cell = getCell(r, c)
                         if (cell.raw === '') continue
-                        const w = measure(displayText(cell, getStyle(r, c)), getStyle(r, c))
+                        const style = getStyle(r, c)
+                        const w = measured(displayText(cell, style), style)
                         if (w > widest) widest = w
                     }
                 }

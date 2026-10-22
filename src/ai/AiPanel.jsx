@@ -5,6 +5,10 @@
 // executeQuery() running over the sheet. Re-run executes the same plan
 // again without asking the model. Insert writes the table into the sheet
 // as one undo step.
+//
+// Formatting requests come back as a format_sheet action. Nothing happens
+// to the sheet until you press Apply on the preview card; then it goes
+// through the engine's style system as one undo step.
 
 import { useEffect, useRef, useState } from 'react'
 import { createProvider } from './provider.js'
@@ -13,6 +17,8 @@ import { readTable } from './sheetTable.js'
 import { buildContext } from './context.js'
 import { executeQuery } from './executor.js'
 import { describePlan } from './describePlan.js'
+import { applyFormat, describeFormat, inspectSheet } from './formatApplier.js'
+import { measureText } from '../grid/measure.js'
 import { parseA1, toA1 } from '../engine/address.js'
 import './AiPanel.css'
 
@@ -21,13 +27,15 @@ const EXAMPLES = [
     'Top 3 sales reps by total sales',
     'How many orders were placed in February 2024?',
     'Break down sales by region and category',
+    'Format this as a clean table',
+    'Highlight the totals row in yellow',
 ]
 const HISTORY_TURNS = 4 // earlier exchanges sent along for follow-up questions
 
 const ERROR_TITLES = {
     PROVIDER_ERROR: "Couldn't get an answer from the model",
     INVALID_RESPONSE: "The model's answer wasn't a valid plan",
-    READ_ONLY: 'That would change the sheet. I can only read it.',
+    READ_ONLY: "That would change the data. I can read it and format it, but not edit it.",
     UNKNOWN_OP: 'The plan used a filter I don\'t know',
     UNKNOWN_FN: 'The plan used a calculation I don\'t know',
     UNKNOWN_SORT_COLUMN: 'The plan sorts by a column that isn\'t in the result',
@@ -38,8 +46,9 @@ const REASONS = {
 
 let nextId = 1
 
-// ?debug (which sets window.__engine) also exposes the executor for perf/measure.mjs
-if (typeof window !== 'undefined' && window.__engine) window.__ai = { readTable, executeQuery }
+// ?debug (which sets window.__engine) also exposes the executor and the
+// format applier for perf/measure.mjs
+if (typeof window !== 'undefined' && window.__engine) window.__ai = { readTable, executeQuery, applyFormat, measureText }
 
 export default function AiPanel({ engine, selection, activeCell, onClose }) {
     const [provider] = useState(() => createProvider())
@@ -102,7 +111,7 @@ export default function AiPanel({ engine, selection, activeCell, onClose }) {
             <div className="ai-list" ref={listRef}>
                 {entries.length === 0 && (
                     <div className="ai-empty">
-                        <p>Ask a question about the table on the sheet. The model writes a plan; the numbers are worked out here, from your data.</p>
+                        <p>Ask a question about the table on the sheet, or say how it should look. The model writes a plan; the numbers are worked out here, from your data, and formatting waits for you to press Apply.</p>
                         <div className="ai-examples">
                             {EXAMPLES.map(x => <button key={x} onClick={() => ask(x)}>{x}</button>)}
                         </div>
@@ -113,7 +122,7 @@ export default function AiPanel({ engine, selection, activeCell, onClose }) {
                         <div className="ai-prompt">{entry.prompt}</div>
                         {entry.pending
                             ? <div className="ai-card pending">Thinking…</div>
-                            : <Answer entry={entry} engine={engine} activeCell={activeCell} onRerun={() => rerun(entry)} onToggle={(k) => update(entry.id, { [k]: !entry[k] })} />}
+                            : <Answer entry={entry} engine={engine} activeCell={activeCell} onRerun={() => rerun(entry)} onToggle={(k) => update(entry.id, { [k]: !entry[k] })} onUpdate={(patch) => update(entry.id, patch)} />}
                     </div>
                 ))}
             </div>
@@ -133,8 +142,12 @@ export default function AiPanel({ engine, selection, activeCell, onClose }) {
     )
 }
 
-function Answer({ entry, engine, activeCell, onRerun, onToggle }) {
+function Answer({ entry, engine, activeCell, onRerun, onToggle, onUpdate }) {
     const { answer, result } = entry
+
+    if (answer.kind === 'format_sheet') {
+        return <FormatCard entry={entry} engine={engine} onToggle={onToggle} onUpdate={onUpdate} />
+    }
 
     if (answer.kind === 'clarify') {
         return <div className="ai-card clarify"><span className="ai-label">Question back</span>{answer.question}<PlanToggle entry={entry} onToggle={onToggle} /></div>
@@ -187,6 +200,47 @@ function Answer({ entry, engine, activeCell, onRerun, onToggle }) {
             <div className="ai-actions">
                 <button className="toolbar-btn" onClick={onRerun} title="Run the same plan again on the current data (no model call)">Re-run</button>
                 <InsertButton engine={engine} result={result} activeCell={activeCell} />
+                <PlanToggle entry={entry} onToggle={onToggle} inline />
+            </div>
+        </div>
+    )
+}
+
+// Preview of a format_sheet action in plain words, then Apply / Discard.
+// The preview is worked out against the sheet as it is now, so it can say
+// up front what will be skipped (a column past the table, a totals style
+// with no totals row, a freeze that's too big).
+function FormatCard({ entry, engine, onToggle, onUpdate }) {
+    const { answer, applied, discarded } = entry
+    const lines = describeFormat(answer.action, inspectSheet(engine))
+
+    const apply = () => {
+        const outcome = applyFormat(engine, answer.action, { measure: measureText })
+        onUpdate({ applied: outcome })
+    }
+
+    let status = null
+    if (applied) {
+        const cls = applied.result === 'APPLIED' ? 'ok' : applied.result === 'OUT_OF_RANGE' ? 'bad' : 'muted'
+        status = <div className={'ai-format-status ' + cls}><span className="ai-error-code">{applied.result}</span> {applied.message}</div>
+    } else if (discarded) {
+        status = <div className="ai-format-status muted">Discarded. Nothing was changed.</div>
+    }
+
+    return (
+        <div className="ai-card result format">
+            <span className="ai-label">Formatting preview</span>
+            <ul className="ai-format-lines">
+                {lines.map((line, i) => <li key={i}>{line}</li>)}
+            </ul>
+            {status}
+            <div className="ai-actions">
+                {!applied && !discarded && (
+                    <>
+                        <button className="toolbar-btn active" onClick={apply} title="Apply to the sheet (one Ctrl+Z undoes it)">Apply</button>
+                        <button className="toolbar-btn" onClick={() => onUpdate({ discarded: true })}>Discard</button>
+                    </>
+                )}
                 <PlanToggle entry={entry} onToggle={onToggle} inline />
             </div>
         </div>

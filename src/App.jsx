@@ -149,6 +149,18 @@ export default function App() {
           </div>
 
           <div className="toolbar-group">
+            <span className="toolbar-label">Format:</span>
+            {/* only changes what the cell shows; the stored value stays as typed */}
+            <select className="toolbar-select" value={activeStyle.numberFormat} onChange={(e) => applyStyle({ numberFormat: e.target.value })} title="Number format">
+              <option value="general">General</option>
+              <option value="number">Number (1,234.50)</option>
+              <option value="currency">Currency ($1,234.50)</option>
+              <option value="percent">Percent (12%)</option>
+              <option value="date">Date (2024-01-15)</option>
+            </select>
+          </div>
+
+          <div className="toolbar-group">
             <button className={`align-btn ${activeStyle.align === 'left' ? 'active' : ''}`} onClick={() => applyStyle({ align: 'left' })} title="Align Left">⬤←</button>
             <button className={`align-btn ${activeStyle.align === 'center' ? 'active' : ''}`} onClick={() => applyStyle({ align: 'center' })} title="Align Center">⬤</button>
             <button className={`align-btn ${activeStyle.align === 'right' ? 'active' : ''}`} onClick={() => applyStyle({ align: 'right' })} title="Align Right">⬤→</button>

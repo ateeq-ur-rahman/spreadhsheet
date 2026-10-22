@@ -82,6 +82,8 @@ export default function App() {
     setSelection(cellSelection(0, 0))
   }
 
+  const filterInfo = engine.filterStatus()
+
   const status = range.r1 === range.r2 && range.c1 === range.c2
     ? toA1(active.r, active.c)
     : `${rangeToA1(range)} (${rowCount}R × ${colCount}C)`
@@ -189,9 +191,17 @@ export default function App() {
           onFormat={toggle}
         />
 
-        <p className="footer-hint">
-          Click to select · drag / Shift+Click / Shift+Arrow to extend · double-click, Enter, F2 or type to edit · drag the ■ handle to fill · Delete clears · Ctrl+Z / Ctrl+Y
-        </p>
+        <div className="footer-hint status-line">
+          {filterInfo && (
+            <span className="filter-status" data-testid="filter-status">
+              {filterInfo.visible} of {filterInfo.total} rows
+              <button className="toolbar-btn" onClick={() => engine.clearFilters()}>Clear filters</button>
+            </span>
+          )}
+          <span>
+            Click to select · drag / Shift+Click / Shift+Arrow to extend · double-click, Enter, F2 or type to edit · drag the ■ handle to fill · ⇅ sorts, ▾ filters · Ctrl+Z / Ctrl+Y
+          </span>
+        </div>
       </div>
     </div>
   )

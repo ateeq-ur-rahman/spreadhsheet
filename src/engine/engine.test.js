@@ -154,3 +154,13 @@ describe('used range', () => {
         })
     })
 })
+
+describe('bounds', () => {
+    it('grows the sheet when writing past the last row or column', () => {
+        const e = createEngine(5, 5)
+        e.setCell(9, 7, 'x')
+        expect(e.rows).toBe(10)
+        expect(e.cols).toBe(8)
+        expect(e.getRowId(9)).toBeDefined()
+    })
+})

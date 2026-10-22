@@ -8,8 +8,9 @@
 
 import {
     parseFormula, evaluate, isFormula, isErrorValue, FormulaError, ERR,
-    translateFormula, remapFormulaStructural, structuralMapper,
+    translateFormula, remapFormulaStructural, structuralMapper, remapFormulaRows,
 } from './formula.js'
+import { sortKey, sortedOrder, isTotalsLabel, compileFilter, isEmptyFilter } from './sortFilter.js'
 import { parseNumberLiteral } from './values.js'
 import { normalizeRange } from './address.js'
 import { createSeries } from './fill.js'
@@ -44,6 +45,28 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     const refDeps = new Map()
     const rangeDeps = new Map()
     const rangeCols = new Map()
+
+    // Stable ids for rows and columns. Positions change on insert/delete/sort,
+    // ids don't. Sort uses them to get back to the original order, and filters
+    // are stored per column id so they stay on the right column.
+    const rowIds = []
+    const colIds = []
+    let nextId = 1
+    function ensureIds() {
+        while (rowIds.length < rows) rowIds.push(nextId++)
+        while (colIds.length < cols) colIds.push(nextId++)
+    }
+    ensureIds()
+
+    // Filters are a view: colId -> spec. Which rows are hidden is worked out
+    // from the current values and cached until something changes.
+    const filters = new Map()
+    let hiddenRows = new Set()
+    let hiddenDirty = true
+
+    // { colId, dir, originalIds } while a sort is active. originalIds is the
+    // block's row order before the first sort, for the "back to original" click.
+    let sortState = null
 
     const undoStack = []
     const redoStack = []
@@ -218,6 +241,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
 
     function record(op) {
         tx.inverse.push(op)
+        hiddenDirty = true
     }
 
     function writeRaw(row, col, raw) {
@@ -227,6 +251,12 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         const next = raw === null || raw === undefined ? '' : String(raw)
         const isEmpty = next.trim() === ''
         if (isEmpty ? oldRaw === '' : oldRaw === next) return
+        // writing past the edge grows the sheet (bounds aren't undone, they're not data)
+        if (row >= rows || col >= cols) {
+            rows = Math.max(rows, row + 1)
+            cols = Math.max(cols, col + 1)
+            ensureIds()
+        }
         record({ t: 'cell', row, col, raw: oldRaw })
         usedRangeVersion = -1
         if (old && old.f) unindexFormula(key, old.f)
@@ -272,7 +302,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     // too), cells and styles move, and only formulas whose text changed get
     // recalculated. Undoing a delete = insert again, then put back the deleted
     // cells/styles and the original text of every formula we rewrote.
-    function structural(axis, kind, at, count) {
+    function structural(axis, kind, at, count, ids) {
         const mapper = structuralMapper(kind, at, count)
         const restoreCells = []
         const restoreStyles = []
@@ -317,6 +347,16 @@ export function createEngine(initialRows = 50, initialCols = 50) {
 
         if (axis === 'row') rows += kind === 'insert' ? count : -count
         else cols += kind === 'insert' ? count : -count
+        const idList = axis === 'row' ? rowIds : colIds
+        let removedIds = null
+        if (kind === 'insert') {
+            // undoing a delete brings the old ids back; a fresh insert gets new ones
+            const fresh = ids || Array.from({ length: count }, () => nextId++)
+            idList.splice(at, 0, ...fresh)
+        } else {
+            removedIds = idList.splice(at, count)
+        }
+        ensureIds()
         rebuildIndex()
 
         if (kind === 'insert') {
@@ -328,15 +368,85 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             }
             for (const c of restoreCells) record({ t: 'cell', row: c.row, col: c.col, raw: c.raw })
             for (const s of restoreStyles) record({ t: 'style', row: s.row, col: s.col, style: s.style })
-            record({ t: 'struct', axis, kind: 'insert', at, count })
+            record({ t: 'struct', axis, kind: 'insert', at, count, ids: removedIds })
         }
+    }
+
+    // Move rows around inside the block starting at r1: new row r1+i gets what
+    // was in row r1+order[i]. Values, styles and row ids move with their rows.
+    // Single references into the block follow the rows they pointed at (in
+    // every formula on the sheet); ranges stay as written. The inverse is just
+    // the inverse permutation.
+    function permuteRows(r1, order) {
+        const n = order.length
+        const r2 = r1 + n - 1
+        const newOffsetOf = new Int32Array(n)
+        let identity = true
+        for (let i = 0; i < n; i++) {
+            newOffsetOf[order[i]] = i
+            if (order[i] !== i) identity = false
+        }
+        if (identity) return
+        const mapRow = (r) => (r >= r1 && r <= r2 ? r1 + newOffsetOf[r - r1] : r)
+
+        for (const cell of cells.values()) {
+            if (!cell.f || cell.f.error) continue
+            if (!cell.f.refs.some(ref => ref.row >= r1 && ref.row <= r2)) continue
+            const next = remapFormulaRows(cell.raw, mapRow)
+            if (next !== cell.raw) {
+                cell.raw = next
+                cell.f = parseFormula(next)
+            }
+        }
+
+        const moveBlock = (map) => {
+            const moved = []
+            for (const [key, val] of map) {
+                const r = rowOf(key)
+                if (r >= r1 && r <= r2) moved.push([key, val])
+            }
+            for (const [key] of moved) map.delete(key)
+            for (const [key, val] of moved) map.set(keyOf(mapRow(rowOf(key)), colOf(key)), val)
+            return moved
+        }
+        const movedCells = moveBlock(cells)
+        moveBlock(styles)
+        moveBlock(computed)
+
+        // anything that reads a moved cell (ranges included) needs a recalc
+        for (const [key] of movedCells) {
+            tx.dirty.add(keyOf(mapRow(rowOf(key)), colOf(key)))
+            tx.dirty.add(key)
+        }
+        const blockIds = rowIds.slice(r1, r2 + 1)
+        for (let i = 0; i < n; i++) rowIds[r1 + i] = blockIds[order[i]]
+        rebuildIndex()
+        record({ t: 'permute', r1, order: Array.from(newOffsetOf) })
+    }
+
+    function writeFilter(colId, spec) {
+        const old = filters.get(colId) || null
+        const next = isEmptyFilter(spec) ? null : spec
+        if (JSON.stringify(old) === JSON.stringify(next)) return
+        record({ t: 'filter', colId, spec: old })
+        if (next) filters.set(colId, next)
+        else filters.delete(colId)
+    }
+
+    function writeSortState(state) {
+        if (JSON.stringify(sortState) === JSON.stringify(state)) return
+        record({ t: 'sortState', state: sortState })
+        sortState = state
     }
 
     function applyOp(op) {
         switch (op.t) {
             case 'cell': return writeRaw(op.row, op.col, op.raw)
             case 'style': return writeStyle(op.row, op.col, op.style)
-            case 'struct': return structural(op.axis, op.kind, op.at, op.count)
+            case 'struct': return structural(op.axis, op.kind, op.at, op.count, op.ids)
+            case 'permute': return permuteRows(op.r1, op.order)
+            case 'filter': return writeFilter(op.colId, op.spec)
+            case 'sortState': return writeSortState(op.state)
             // placeholder so an action that changed nothing still gets an undo step
             case 'noop': return record(op)
             default: throw new Error('Unknown op ' + op.t)
@@ -545,6 +655,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         let filled = 0
         if (t.r2 >= rows) rows = t.r2 + 1
         if (t.c2 >= cols) cols = t.c2 + 1
+        ensureIds()
         transact('Fill', () => {
             // Always give a fill its own undo step, even if it wrote the same
             // values that were already there. Otherwise Ctrl+Z right after it
@@ -589,7 +700,168 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         transact('Clear all', () => {
             for (const key of Array.from(cells.keys())) writeRaw(rowOf(key), colOf(key), '')
             for (const key of Array.from(styles.keys())) writeStyle(rowOf(key), colOf(key), null)
+            for (const colId of Array.from(filters.keys())) writeFilter(colId, null)
+            writeSortState(null)
         })
+    }
+
+    // Filters
+
+    const colIndexOf = (colId) => colIds.indexOf(colId)
+
+    // Rows 1..last used row are data (row 0 is the header). Hidden rows are
+    // recomputed from current values whenever anything changed.
+    function getHiddenRows() {
+        if (!hiddenDirty) return hiddenRows
+        hiddenDirty = false
+        hiddenRows = new Set()
+        if (filters.size === 0) return hiddenRows
+        const used = getUsedRange()
+        if (!used) return hiddenRows
+        const tests = []
+        for (const [colId, spec] of filters) {
+            const c = colIndexOf(colId)
+            if (c >= 0) tests.push([c, compileFilter(spec)])
+        }
+        for (let r = 1; r <= used.r2; r++) {
+            for (const [c, test] of tests) {
+                if (!test(getValue(r, c))) { hiddenRows.add(r); break }
+            }
+        }
+        return hiddenRows
+    }
+
+    function setFilter(col, spec) {
+        transact(spec ? 'Filter' : 'Clear filter', () => writeFilter(colIds[col], spec))
+    }
+
+    function clearFilters() {
+        transact('Clear filters', () => {
+            for (const colId of Array.from(filters.keys())) writeFilter(colId, null)
+        })
+    }
+
+    function getFilter(col) {
+        return filters.get(colIds[col]) || null
+    }
+
+    // Distinct values in a column for the filter checklist. Values that only
+    // differ by case or spaces ("West", "West ", "west") are one entry, shown
+    // with whichever spelling came first.
+    function getFilterValues(col) {
+        const used = getUsedRange()
+        const groups = new Map()
+        if (!used) return []
+        for (let r = 1; r <= used.r2; r++) {
+            const v = getValue(r, col)
+            const k = String(v).trim().toLowerCase()
+            const g = groups.get(k)
+            if (g) g.count++
+            else groups.set(k, { key: k, label: k === '' ? '(Blanks)' : String(v).trim(), count: 1, sort: sortKey(v) })
+        }
+        const list = Array.from(groups.values())
+        const order = sortedOrder(list.map(g => g.sort), 'asc')
+        return order.map(i => ({ key: list[i].key, label: list[i].label, count: list[i].count }))
+    }
+
+    // { visible, total } data rows, or null when no filter is on
+    function filterStatus() {
+        if (filters.size === 0) return null
+        const used = getUsedRange()
+        const total = used ? used.r2 : 0
+        return { visible: total - getHiddenRows().size, total }
+    }
+
+    // Sort
+
+    // A row with no typed content (formulas don't count) is a blank row.
+    function isBlankRow(r, c1, c2) {
+        for (let c = c1; c <= c2; c++) {
+            const cell = cells.get(keyOf(r, c))
+            if (cell && !cell.f) return false
+        }
+        return true
+    }
+
+    // Which rows a sort moves. With a multi-cell selection it's exactly those
+    // rows. Otherwise it's the used range minus the header (row 1) and minus a
+    // trailing totals row, which stays pinned at the bottom.
+    function sortBlock(range) {
+        const used = getUsedRange()
+        if (!used) return null
+        if (range) return { r1: range.r1, r2: range.r2, c1: used.c1, c2: used.c2 }
+        let r2 = used.r2
+        if (r2 >= 2) {
+            for (let c = used.c1; c <= used.c2; c++) {
+                const v = getValue(r2, c)
+                if (String(v).trim() === '') continue
+                if (isTotalsLabel(v)) r2--
+                break
+            }
+        }
+        return { r1: 1, r2, c1: used.c1, c2: used.c2 }
+    }
+
+    // Sort by column `col`: 'asc', 'desc' or 'original'. Only visible rows
+    // move; hidden (filtered) rows keep their positions. Blank rows go last.
+    // One undo step.
+    function sortColumn(col, dir, range = null) {
+        const block = sortBlock(range)
+        if (!block || block.r2 - block.r1 < 1) return
+        const hidden = getHiddenRows()
+        const n = block.r2 - block.r1 + 1
+        const visible = []
+        for (let i = 0; i < n; i++) if (!hidden.has(block.r1 + i)) visible.push(i)
+
+        let seq
+        if (dir === 'original') {
+            const rank = new Map((sortState?.originalIds || []).map((id, i) => [id, i]))
+            const keyOfRow = (i) => rank.get(rowIds[block.r1 + i]) ?? Infinity
+            seq = visible.map((i, k) => [keyOfRow(i), k, i])
+                .sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]))
+                .map(x => x[2])
+        } else {
+            const real = []
+            const blank = []
+            for (const i of visible) (isBlankRow(block.r1 + i, block.c1, block.c2) ? blank : real).push(i)
+            const keys = real.map(i => sortKey(getValue(block.r1 + i, col)))
+            seq = sortedOrder(keys, dir).map(k => real[k]).concat(blank)
+        }
+
+        const order = Array.from({ length: n }, (_, i) => i)
+        visible.forEach((pos, k) => { order[pos] = seq[k] })
+
+        const label = dir === 'original' ? 'Sort: original order' : `Sort ${dir === 'asc' ? 'ascending' : 'descending'}`
+        transact(label, () => {
+            // like fill, a sort that happens to change nothing still gets its own undo step
+            record({ t: 'noop' })
+            if (dir === 'original') {
+                permuteRows(block.r1, order)
+                writeSortState(null)
+            } else {
+                const originalIds = sortState?.originalIds || rowIds.slice(block.r1, block.r2 + 1)
+                permuteRows(block.r1, order)
+                writeSortState({ colId: colIds[col], dir, originalIds })
+            }
+        })
+    }
+
+    // What clicking a column's sort button does: asc -> desc -> original.
+    function cycleSort(col, range = null) {
+        const same = sortState && sortState.colId === colIds[col]
+        const next = !same ? 'asc' : sortState.dir === 'asc' ? 'desc' : 'original'
+        sortColumn(col, next, range)
+        return next
+    }
+
+    function getSortState() {
+        if (!sortState) return null
+        const col = colIndexOf(sortState.colId)
+        return col < 0 ? null : { col, dir: sortState.dir }
+    }
+
+    function clearSortState() {
+        transact('Forget sort', () => writeSortState(null))
     }
 
     return {
@@ -626,8 +898,22 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             let changed = false
             if (minRows > rows) { rows = minRows; changed = true }
             if (minCols > cols) { cols = minCols; changed = true }
+            ensureIds()
             if (changed) notify()
         },
+        getRowId: (r) => rowIds[r],
+        getColId: (c) => colIds[c],
+        sortColumn,
+        cycleSort,
+        getSortState,
+        clearSortState,
+        setFilter,
+        getFilter,
+        clearFilters,
+        getFilterValues,
+        filterStatus,
+        isRowHidden: (r) => getHiddenRows().has(r),
+        getHiddenRows,
         subscribe(fn) {
             listeners.add(fn)
             return () => listeners.delete(fn)

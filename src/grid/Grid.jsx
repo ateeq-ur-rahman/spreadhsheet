@@ -5,19 +5,23 @@
 //   CellsLayer  only when engine.version changes
 //   Overlay     when the selection or the fill preview changes
 //   CellEditor  on each keystroke (it reads the edit store directly)
+//
+// Filtered-out rows get height 0 in the row axis, so they simply take no
+// space and their row numbers don't show (that's the "gap").
 
 import { memo, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { colToLetters } from '../engine/address.js'
 import { DEFAULT_STYLE } from '../engine/core.js'
 import { displayText } from '../engine/display.js'
 import {
-    HEADER_WIDTH, HEADER_HEIGHT, DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, uniformAxis,
+    HEADER_WIDTH, HEADER_HEIGHT, DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, uniformAxis, variableAxis,
 } from './layout.js'
 import {
     cellSelection, selectionRange, rangeSelection, moveSelection, extendTo,
     rowSelection, columnSelection, fillTarget,
 } from './selection.js'
 import { commitEdit, cancelEdit } from './editing.js'
+import FilterMenu from './FilterMenu.jsx'
 import './Grid.css'
 
 function cellCss(style, isError) {
@@ -42,6 +46,7 @@ const CellsLayer = memo(function CellsLayer({ engine, version, rowAxis, colAxis 
     const rEnd = box ? Math.min(box.r2, rowAxis.count - 1) : -1
     const cEnd = box ? Math.min(box.c2, colAxis.count - 1) : -1
     for (let r = box ? box.r1 : 0; r <= rEnd; r++) {
+        if (rowAxis.size(r) === 0) continue // filtered out
         for (let c = box.c1; c <= cEnd; c++) {
             const cell = engine.getCell(r, c)
             const style = engine.getStyle(r, c)
@@ -61,25 +66,59 @@ const CellsLayer = memo(function CellsLayer({ engine, version, rowAxis, colAxis 
             )
         }
     }
+    // Horizontal grid lines are drawn per run of visible rows, so hidden
+    // rows don't leave the stripes out of step with the cells.
+    const lines = visibleRuns(rowAxis).map(([from, to]) => (
+        <div
+            key={'run' + from}
+            className="grid-row-lines"
+            style={{
+                top: rowAxis.offset(from),
+                height: rowAxis.offset(to) + rowAxis.size(to) - rowAxis.offset(from),
+                backgroundSize: `100% ${DEFAULT_ROW_HEIGHT}px`,
+            }}
+        />
+    ))
     return (
         <div
             className="grid-cells"
             style={{
                 width: colAxis.total(), height: rowAxis.total(),
-                backgroundSize: `${DEFAULT_COL_WIDTH}px ${DEFAULT_ROW_HEIGHT}px`,
+                backgroundSize: `${DEFAULT_COL_WIDTH}px 100%`,
             }}
         >
+            {lines}
             {out}
         </div>
     )
 })
 
+function visibleRuns(axis) {
+    const runs = []
+    let start = -1
+    for (let r = 0; r < axis.count; r++) {
+        if (axis.size(r) > 0) {
+            if (start < 0) start = r
+        } else if (start >= 0) {
+            runs.push([start, r - 1])
+            start = -1
+        }
+    }
+    if (start >= 0) runs.push([start, axis.count - 1])
+    return runs
+}
+
 // Headers
 
-function ColumnHeaders({ colAxis, selRange, fullCols }) {
+// Columns inside the used range get a sort button (cycles asc / desc /
+// original) and a filter button.
+function ColumnHeaders({ colAxis, selRange, fullCols, used, sortState, isFiltered }) {
     const items = []
     for (let c = 0; c < colAxis.count; c++) {
         const inSel = c >= selRange.c1 && c <= selRange.c2
+        const hasData = used && c >= used.c1 && c <= used.c2
+        const sorted = sortState && sortState.col === c ? sortState.dir : null
+        const filtered = isFiltered(c)
         items.push(
             <div
                 key={c}
@@ -87,6 +126,26 @@ function ColumnHeaders({ colAxis, selRange, fullCols }) {
                 style={{ left: HEADER_WIDTH + colAxis.offset(c), width: colAxis.size(c) }}
             >
                 {colToLetters(c)}
+                {hasData && (
+                    <span className="grid-header-tools">
+                        <button
+                            className={'grid-header-btn' + (sorted ? ' on' : '')}
+                            data-action="sort"
+                            data-col={c}
+                            title="Sort: ascending, descending, original order"
+                        >
+                            {sorted === 'asc' ? '▲' : sorted === 'desc' ? '▼' : '⇅'}
+                        </button>
+                        <button
+                            className={'grid-header-btn' + (filtered ? ' on' : '')}
+                            data-action="filter"
+                            data-col={c}
+                            title={filtered ? 'Filter (active)' : 'Filter'}
+                        >
+                            ▾
+                        </button>
+                    </span>
+                )}
             </div>,
         )
     }
@@ -101,6 +160,7 @@ function ColumnHeaders({ colAxis, selRange, fullCols }) {
 function RowHeaders({ rowAxis, selRange, fullRows }) {
     const items = []
     for (let r = 0; r < rowAxis.count; r++) {
+        if (rowAxis.size(r) === 0) continue // hidden by a filter: leave a gap in the numbers
         const inSel = r >= selRange.r1 && r <= selRange.r2
         items.push(
             <div
@@ -182,13 +242,42 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
     const viewportRef = useRef(null)
     const [fillPreview, setFillPreview] = useState(null)
     const [dragging, setDragging] = useState(false)
+    const [filterMenu, setFilterMenu] = useState(null) // { col, x, y }
 
     const rows = engine.rows
     const cols = engine.cols
     const bounds = { rows, cols }
-    // stable between renders unless the sheet size changes (CellsLayer is memoized)
-    const rowAxis = useAxis(rows, DEFAULT_ROW_HEIGHT)
-    const colAxis = useAxis(cols, DEFAULT_COL_WIDTH)
+    // The engine hands back the same Set until something changes, so these
+    // stay stable between renders (CellsLayer is memoized on them).
+    const hidden = engine.getHiddenRows()
+    const rowAxis = useMemo(
+        () => (hidden.size === 0
+            ? uniformAxis(rows, DEFAULT_ROW_HEIGHT)
+            : variableAxis(rows, (r) => (hidden.has(r) ? 0 : DEFAULT_ROW_HEIGHT))),
+        [rows, hidden],
+    )
+    const colAxis = useMemo(() => uniformAxis(cols, DEFAULT_COL_WIDTH), [cols])
+
+    // Arrow keys and Enter skip rows hidden by a filter.
+    const step = (sel, dr, dc, extend = false) => {
+        let next = moveSelection(sel, dr, dc, bounds, extend)
+        let guard = rows
+        while (dr !== 0 && hidden.has(next.focus.r) && guard-- > 0) {
+            const further = moveSelection(next, dr, 0, bounds, extend)
+            if (further.focus.r === next.focus.r) return sel // nothing visible that way
+            next = further
+        }
+        return next
+    }
+
+    // Sort the selection if there is one (more than one cell, not whole
+    // rows/columns), otherwise the whole table.
+    const sortRange = () => {
+        const r = selectionRange(selection)
+        const multi = r.r1 !== r.r2 || r.c1 !== r.c2
+        const whole = (r.r1 === 0 && r.r2 === rows - 1) || (r.c1 === 0 && r.c2 === cols - 1)
+        return multi && !whole ? r : null
+    }
 
     const focusGrid = () => viewportRef.current?.focus({ preventScroll: true })
 
@@ -279,6 +368,18 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
         commitEdit(engine, editStore)
         focusGrid()
 
+        const action = e.target.dataset.action
+        if (action === 'sort') {
+            engine.cycleSort(Number(e.target.dataset.col), sortRange())
+            return
+        }
+        if (action === 'filter') {
+            const b = e.target.getBoundingClientRect()
+            const col = Number(e.target.dataset.col)
+            setFilterMenu((open) => (open && open.col === col ? null : { col, x: b.left, y: b.bottom + 2 }))
+            return
+        }
+
         const source = selectionRange(selection)
         if (e.target.dataset.role === 'fill-handle') {
             let target = source
@@ -346,7 +447,7 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
         if (arrows[key]) {
             e.preventDefault()
             const [dr, dc] = arrows[key]
-            select(moveSelection(selection, dr, dc, bounds, e.shiftKey))
+            select(step(selection, dr, dc, e.shiftKey))
         } else if (key === 'Tab') {
             e.preventDefault()
             select(moveSelection(selection, 0, e.shiftKey ? -1 : 1, bounds))
@@ -378,7 +479,7 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
 
     const finishEdit = (dr, dc) => {
         const cell = commitEdit(engine, editStore)
-        if (cell) select(moveSelection(cellSelection(cell.r, cell.c), dr, dc, bounds))
+        if (cell) select(step(cellSelection(cell.r, cell.c), dr, dc))
         focusGrid()
     }
 
@@ -400,6 +501,7 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
     const fullRows = selRange.c1 === 0 && selRange.c2 === cols - 1
 
     return (
+        <>
         <div
             ref={viewportRef}
             className={'grid-viewport' + (dragging ? ' dragging' : '')}
@@ -409,7 +511,14 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
             onKeyDown={handleKeyDown}
         >
             <div className="grid-canvas" style={{ width: HEADER_WIDTH + colAxis.total(), height: HEADER_HEIGHT + rowAxis.total() }}>
-                <ColumnHeaders colAxis={colAxis} selRange={selRange} fullCols={fullCols} />
+                <ColumnHeaders
+                    colAxis={colAxis}
+                    selRange={selRange}
+                    fullCols={fullCols}
+                    used={engine.getUsedRange()}
+                    sortState={engine.getSortState()}
+                    isFiltered={(c) => engine.getFilter(c) !== null}
+                />
                 <RowHeaders rowAxis={rowAxis} selRange={selRange} fullRows={fullRows} />
                 <div className="grid-body" style={{ left: HEADER_WIDTH, top: HEADER_HEIGHT }}>
                     <CellsLayer engine={engine} version={version} rowAxis={rowAxis} colAxis={colAxis} />
@@ -431,9 +540,16 @@ export default function Grid({ engine, version, selection, onSelectionChange, ed
                 </div>
             </div>
         </div>
+        {filterMenu && (
+            <FilterMenu
+                key={filterMenu.col}
+                engine={engine}
+                col={filterMenu.col}
+                anchor={filterMenu}
+                onSort={(dir) => engine.sortColumn(filterMenu.col, dir, sortRange())}
+                onClose={() => { setFilterMenu(null); focusGrid() }}
+            />
+        )}
+        </>
     )
-}
-
-function useAxis(count, size) {
-    return useMemo(() => uniformAxis(count, size), [count, size])
 }

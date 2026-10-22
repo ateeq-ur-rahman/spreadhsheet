@@ -384,3 +384,10 @@ export function remapFormulaStructural(raw, axis, kind, at, count) {
         },
     )
 }
+
+// Used by sort: rows inside the sorted block move, so single references
+// follow the row they pointed at (mapRow gives the new row). Ranges are left
+// exactly as written, so =SUM(J2:J32) still covers the same block.
+export function remapFormulaRows(raw, mapRow) {
+    return rewriteReferences(raw, (ref) => ({ ...ref, row: mapRow(ref.row) }), (a, b) => [a, b])
+}

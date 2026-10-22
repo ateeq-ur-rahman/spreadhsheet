@@ -18,7 +18,7 @@ Reply with exactly one JSON object and nothing else. It must match one of these 
 ${schemaText}
 
 Rules:
-- Use column names exactly as they appear in "columns" below. If the user mentions a column that isn't there, or it's unclear which column they mean, reply with a "clarify" action asking them; never pick a similar column yourself.
+- Use column names exactly as they appear in "columns" below. Map everyday words to a column when they plainly mean it: "sales reps" or "reps" -> "Sales Rep", "sales", "revenue" or "amount" -> the money total column (e.g. "Total"), "orders" -> counting rows. Reply with a "clarify" action only when nothing in "columns" fits (e.g. "territory" when there is no such column) or two columns fit equally well. Never invent a column name.
 - "query" is read-only. If the user asks to change, delete or add data, reply with "clarify" and explain you can only read.
 - Filters all have to hold (AND). Dates compare as YYYY-MM-DD, e.g. {"column":"Date","op":"gte","value":"2024-02-01"}.
 - "sort" names output columns: a groupBy column, an aggregate's "as" name, or a source column for row results.

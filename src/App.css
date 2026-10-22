@@ -10,6 +10,12 @@ body {
   color: #202124;
 }
 
+.workspace {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
 .name-box {
   width: 140px;
   padding: 6px 8px;

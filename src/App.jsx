@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore } from 'react'
+import { lazy, Suspense, useEffect, useState, useSyncExternalStore } from 'react'
 import './App.css'
 import { createEngine } from './engine/core.js'
 import { toA1, rangeToA1, parseRange } from './engine/address.js'
@@ -8,6 +8,9 @@ import { commitEdit, cancelEdit } from './grid/editing.js'
 import FormulaBar from './grid/FormulaBar.jsx'
 import { cellSelection, selectionRange, rangeSelection } from './grid/selection.js'
 import { counters } from './grid/perfCounters.js'
+
+// The AI panel (and the mock provider's fixtures) load the first time it's opened.
+const AiPanel = lazy(() => import('./ai/AiPanel.jsx'))
 
 const TOTAL_ROWS = 100000
 const TOTAL_COLS = 200
@@ -37,6 +40,19 @@ export default function App() {
   // name box: null while it just shows the selection, the typed text while editing
   const [nameDraft, setNameDraft] = useState(null)
   const [nameError, setNameError] = useState(false)
+  const [aiOpen, setAiOpen] = useState(false)
+
+  // Ctrl+K (Cmd+K) opens and closes the AI panel from anywhere
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setAiOpen(open => !open)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   const selection = clampSelection(rawSelection, engine.rows, engine.cols)
   const range = selectionRange(selection)
@@ -189,6 +205,10 @@ export default function App() {
             <button className="toolbar-btn" onClick={() => loadSample('small')} title="Load fixtures/sales.tsv (33 rows) at A1">⬇ Sample 33</button>
             <button className="toolbar-btn" onClick={() => loadSample('large')} title="Load fixtures/sales-large.tsv (~3,000 rows) at A1">⬇ Sample 3k</button>
           </div>
+
+          <div className="toolbar-group">
+            <button className={`toolbar-btn ${aiOpen ? 'active' : ''}`} onClick={() => setAiOpen(open => !open)} title="Ask your data (Ctrl+K)">✨ Ask (Ctrl+K)</button>
+          </div>
         </div>
 
         {/* Formula Bar */}
@@ -213,16 +233,23 @@ export default function App() {
           />
         </div>
 
-        {/* Grid */}
-        <Grid
-          engine={engine}
-          version={version}
-          selection={selection}
-          onSelectionChange={setSelection}
-          editStore={editStore}
-          onFormat={toggle}
-          reveal={reveal}
-        />
+        {/* Grid + AI panel */}
+        <div className="workspace">
+          <Grid
+            engine={engine}
+            version={version}
+            selection={selection}
+            onSelectionChange={setSelection}
+            editStore={editStore}
+            onFormat={toggle}
+            reveal={reveal}
+          />
+          {aiOpen && (
+            <Suspense fallback={<aside className="ai-panel ai-loading">Loading…</aside>}>
+              <AiPanel engine={engine} selection={range} activeCell={active} onClose={() => setAiOpen(false)} />
+            </Suspense>
+          )}
+        </div>
 
         <div className="footer-hint status-line">
           {filterInfo && (

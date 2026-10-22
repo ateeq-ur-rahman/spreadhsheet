@@ -26,4 +26,15 @@ export default defineConfig([
       'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
     },
   },
+  // Code that runs in Node, not the browser: the Vite config, the AI server
+  // and the perf scripts
+  {
+    files: ['vite.config.js', 'server/**/*.{js,mjs}', 'perf/**/*.mjs'],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: { ...globals.node, ...globals.browser },
+    },
+  },
 ])

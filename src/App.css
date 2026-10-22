@@ -10,6 +10,26 @@ body {
   color: #202124;
 }
 
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.filter-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: #1a73e8;
+  white-space: nowrap;
+}
+
+.filter-status .toolbar-btn {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
 /* index.css makes body a centred flex box, which let #root grow as wide as
    the grid and the whole page scrolled sideways. Keep the app at screen size. */
 body {
